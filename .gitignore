@@ -1,0 +1,18 @@
+# Credentials and user-specific data
+casambi_credentials.json
+bpm_cache.json
+
+# Internal docs (not for public repo)
+PROGRESS.md
+ROADMAP.md
+OPEN_SOURCE.md
+
+# Binary
+casambi-go
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
