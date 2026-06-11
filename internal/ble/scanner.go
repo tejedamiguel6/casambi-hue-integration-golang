@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/migueltejeda/casambi-go/internal/crypto"
@@ -30,6 +31,7 @@ type Connection struct {
 	Flags          uint16
 	notifyCh       chan []byte // shared notification channel
 	commandCounter uint32     // outgoing command counter, starts at 2 (1 is used by auth)
+	cmdMu          sync.Mutex // protects commandCounter and serializes BLE writes
 }
 
 // This is the service UUID that all Casambi devices advertise.
@@ -416,6 +418,9 @@ func (c *Connection) parseAuthResponse(response []byte, transportKey [16]byte) e
 // Wire format: [Counter: 4B LE] [Encrypted command] [CMAC: 16B]
 // Same encrypt-then-MAC pattern as auth, using outgoing counter (starts at 2).
 func (c *Connection) SendCommand(cmd *protocol.CommandPacket) error {
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+
 	payload := cmd.Encode()
 
 	// Build full packet: [counter: 4B LE] [0x07 type] [command data]

@@ -90,8 +90,8 @@ func extractTopColors(img image.Image, n int) []HSV {
 
 			h, s, v := rgbToHSV(rf, gf, bf)
 
-			// Skip very dark, very light, or desaturated pixels
-			if s < 0.15 || v < 0.10 || v > 0.95 {
+			// Skip dark, desaturated, or near-white pixels — we want vivid colors
+			if s < 0.25 || v < 0.15 {
 				continue
 			}
 
@@ -130,21 +130,33 @@ func extractTopColors(img image.Image, n int) []HSV {
 		b := buckets[scores[i].idx]
 		avgHue := b.hue / float64(b.count)
 		avgSat := b.sat / float64(b.count)
-		avgVal := b.val / float64(b.count)
 
 		// Handle negative hue from red wrap-around
 		if avgHue < 0 {
 			avgHue += 360
 		}
 
+		// Use full value and boost saturation — LEDs need high saturation to show color.
+		// Album art colors are often muted, but we want vivid lighting.
+		boostedSat := clampF(avgSat*1.5, 0.7, 1.0) // boost and floor at 70%
 		result = append(result, HSV{
 			Hue: int(avgHue / 360.0 * 65535),
-			Sat: int(avgSat * 254),
-			Val: int(avgVal * 254),
+			Sat: int(boostedSat * 254),
+			Val: 254,
 		})
 	}
 
 	return result
+}
+
+func clampF(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func rgbToHSV(r, g, b float64) (h, s, v float64) {

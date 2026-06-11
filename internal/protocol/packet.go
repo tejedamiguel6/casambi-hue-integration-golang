@@ -115,6 +115,76 @@ func NewSetRawStateCommand(state []byte, targetID uint16, targetType TargetType,
 	}
 }
 
+// NewSetColorCommand creates an RGB color command using hue and saturation.
+// hue: 0-1023 (maps to 0-360 degrees), sat: 0-255
+// Uses OpCode 7 (SetColor) — 3-byte payload: [hue_lo, hue_hi, sat]
+func NewSetColorCommand(hue uint16, sat uint8, targetID uint16, targetType TargetType, origin uint16) *CommandPacket {
+	return &CommandPacket{
+		Lifetime: DefaultLifetime,
+		OpCode:   OpSetColor,
+		Origin:   origin,
+		TargetID: targetID,
+		Target:   targetType,
+		Payload:  []byte{byte(hue & 0xFF), byte(hue >> 8), sat},
+	}
+}
+
+// PackState5ch packs dimmer, hue, saturation, white, and temperature into
+// 5 bytes matching the Casambi fixture type 25227 (LINE RGB+TW) state format.
+//
+// Bit layout (little-endian packing, matching casambi-bt):
+//   Offset 0,  8 bits: Dimmer (0-255)
+//   Offset 8,  18 bits: RGB = (hue << 8) | saturation
+//                        hue: 10 bits (0-1023, maps to 0-360°)
+//                        sat: 8 bits (0-255)
+//   Offset 26, 6 bits: White color balance (0-63)
+//   Offset 32, 8 bits: Color temperature (0-255)
+//
+// Verified against known cloud API states:
+//   PackState5ch(255, 1023, 255, 31, 127) → ffffff7f7f (white)
+//   PackState5ch(242, 864, 255, 37, 184)  → f2ff6097b8 (purple)
+func PackState5ch(dimmer uint8, hue uint16, sat uint8, white uint8, temp uint8) []byte {
+	state := make([]byte, 5)
+
+	// Dimmer: 8 bits at offset 0
+	state[0] = dimmer
+
+	// RGB: 18 bits at offset 8 — (hue << 8) | saturation
+	if hue > 1023 {
+		hue = 1023
+	}
+	rgb := (uint32(hue) << 8) | uint32(sat)
+	state[1] = byte(rgb)
+	state[2] = byte(rgb >> 8)
+	state[3] = byte(rgb >> 16) & 0x03 // top 2 bits of 18-bit RGB
+
+	// White color balance: 6 bits at offset 26 (byte 3, bit 2)
+	wcb := white
+	if wcb > 63 {
+		wcb = 63
+	}
+	state[3] |= (wcb & 0x3F) << 2
+
+	// Color temperature: 8 bits at offset 32
+	state[4] = temp
+
+	return state
+}
+
+// NewSetFullStateCommand creates a full-state command for a 5-channel fixture.
+// This sets dimmer, color, white, and temperature atomically in one BLE command.
+// Use white=0 to display pure RGB colors without white channel wash-out.
+func NewSetFullStateCommand(dimmer uint8, hue uint16, sat uint8, white uint8, temp uint8, targetID uint16, targetType TargetType, origin uint16) *CommandPacket {
+	return &CommandPacket{
+		Lifetime: DefaultLifetime,
+		OpCode:   OpSetState,
+		Origin:   origin,
+		TargetID: targetID,
+		Target:   targetType,
+		Payload:  PackState5ch(dimmer, hue, sat, white, temp),
+	}
+}
+
 // NewSetTemperatureCommand creates a color temperature command.
 // The actual Kelvin encoding depends on the unit's min/max range
 // and control bit resolution — you'll need to normalize it.

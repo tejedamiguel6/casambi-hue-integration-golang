@@ -17,14 +17,15 @@ import (
 
 // Server wraps the BLE connection and Hue bridge in an HTTP API.
 type Server struct {
-	conn     *ble.Connection
-	creds    *NetworkCredentials
-	hue      *HueClient
-	beatSync *spotify.BeatSync
-	reactive *audio.ReactiveEngine
-	mux      *http.ServeMux
-	port     string
-	seq      uint16 // command sequence counter
+	conn        *ble.Connection
+	creds       *NetworkCredentials
+	hue         *HueClient
+	HueStreamer *HueStreamer
+	beatSync    *spotify.BeatSync
+	reactive    *audio.ReactiveEngine
+	mux         *http.ServeMux
+	port        string
+	seq         uint16 // command sequence counter
 }
 
 // SpotifyAPIURL can be overridden via environment variable SPOTIFY_NOW_PLAYING_URL
@@ -46,13 +47,21 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 		cmd := protocol.NewSetRawStateCommand(state, unitID, protocol.TargetUnit, 0)
 		conn.SendCommand(cmd)
 	}
+	casambiColor := func(hue uint16, sat uint8, unitID uint16) {
+		cmd := protocol.NewSetColorCommand(hue, sat, unitID, protocol.TargetUnit, 0)
+		conn.SendCommand(cmd)
+	}
+	casambiFullState := func(dimmer uint8, hue uint16, sat uint8, white uint8, temp uint8, unitID uint16) {
+		cmd := protocol.NewSetFullStateCommand(dimmer, hue, sat, white, temp, unitID, protocol.TargetUnit, 0)
+		conn.SendCommand(cmd)
+	}
 
 	s := &Server{
 		conn:     conn,
 		creds:    creds,
 		hue:      hue,
 		beatSync: spotify.NewBeatSync(conn, hue, spotifyAPIURL),
-		reactive: audio.NewReactiveEngine(hue, casambiSend, casambiState, spotifyAPIURL),
+		reactive: audio.NewReactiveEngine(hue, casambiSend, casambiState, casambiColor, casambiFullState, spotifyAPIURL),
 		port:     port,
 		seq:      1,
 	}
@@ -71,6 +80,9 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 	mux.HandleFunc("POST /api/units/{id}/off", s.handleUnitOff)
 	mux.HandleFunc("POST /api/units/{id}/level", s.handleSetLevel)
 	mux.HandleFunc("POST /api/units/{id}/state", s.handleSetState)
+	mux.HandleFunc("POST /api/units/{id}/color", s.handleSetColor)
+	mux.HandleFunc("POST /api/units/{id}/colorxy", s.handleSetColorXY)
+	mux.HandleFunc("POST /api/units/{id}/fullstate", s.handleSetFullState)
 
 	// Casambi scenes (BLE)
 	mux.HandleFunc("GET /api/scenes", s.handleListScenes)
@@ -326,6 +338,107 @@ func (s *Server) handleSetState(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleSetColor(w http.ResponseWriter, r *http.Request) {
+	id, err := s.parseUnitID(r)
+	if err != nil {
+		s.writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Hue int `json:"hue"` // 0-1023 (maps to 0-360 degrees)
+		Sat int `json:"sat"` // 0-255
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if body.Hue < 0 || body.Hue > 1023 {
+		s.writeError(w, "hue must be 0-1023", http.StatusBadRequest)
+		return
+	}
+	if body.Sat < 0 || body.Sat > 255 {
+		s.writeError(w, "sat must be 0-255", http.StatusBadRequest)
+		return
+	}
+	log.Printf("SetColor unit %d: hue=%d (%.0f°), sat=%d", id, body.Hue, float64(body.Hue)/1023*360, body.Sat)
+	cmd := protocol.NewSetColorCommand(uint16(body.Hue), uint8(body.Sat), id, protocol.TargetUnit, s.nextSeq())
+	if err := s.conn.SendCommand(cmd); err != nil {
+		s.writeError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, map[string]any{"status": "ok", "opcode": 7, "hue": body.Hue, "sat": body.Sat})
+}
+
+func (s *Server) handleSetColorXY(w http.ResponseWriter, r *http.Request) {
+	id, err := s.parseUnitID(r)
+	if err != nil {
+		s.writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		X float64 `json:"x"` // CIE x: 0.0-1.0
+		Y float64 `json:"y"` // CIE y: 0.0-1.0
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	// Pack x,y into 3 bytes: (x_scaled << coordLen) | y_scaled, coordLen=11 bits
+	coordLen := 11
+	xyMask := (1 << coordLen) - 1 // 2047
+	xScaled := uint32(body.X * float64(xyMask))
+	yScaled := uint32(body.Y * float64(xyMask))
+	packed := (xScaled << uint(coordLen)) | yScaled
+	payload := []byte{byte(packed), byte(packed >> 8), byte(packed >> 16)}
+	log.Printf("SetColorXY unit %d: x=%.4f y=%.4f packed=%06x", id, body.X, body.Y, packed)
+	cmd := &protocol.CommandPacket{
+		Lifetime: 5,
+		OpCode:   protocol.OpSetColorXY,
+		Origin:   s.nextSeq(),
+		TargetID: id,
+		Target:   protocol.TargetUnit,
+		Payload:  payload,
+	}
+	if err := s.conn.SendCommand(cmd); err != nil {
+		s.writeError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, map[string]any{"status": "ok", "opcode": 54, "x": body.X, "y": body.Y})
+}
+
+func (s *Server) handleSetFullState(w http.ResponseWriter, r *http.Request) {
+	id, err := s.parseUnitID(r)
+	if err != nil {
+		s.writeError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		Dimmer int `json:"dimmer"` // 0-255
+		Hue    int `json:"hue"`    // 0-1023
+		Sat    int `json:"sat"`    // 0-255
+		White  int `json:"white"`  // 0-63 (white color balance)
+		Temp   int `json:"temp"`   // 0-255 (color temperature)
+	}
+	body.Dimmer = 255
+	body.Hue = 0
+	body.Sat = 255
+	body.White = 0
+	body.Temp = 127
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	state := protocol.PackState5ch(uint8(body.Dimmer), uint16(body.Hue), uint8(body.Sat), uint8(body.White), uint8(body.Temp))
+	log.Printf("SetFullState unit %d: dimmer=%d hue=%d sat=%d white=%d temp=%d → %x",
+		id, body.Dimmer, body.Hue, body.Sat, body.White, body.Temp, state)
+	cmd := protocol.NewSetRawStateCommand(state, id, protocol.TargetUnit, s.nextSeq())
+	if err := s.conn.SendCommand(cmd); err != nil {
+		s.writeError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.writeJSON(w, map[string]any{"status": "ok", "opcode": 48, "state": fmt.Sprintf("%x", state)})
+}
+
 func (s *Server) handleSceneOn(w http.ResponseWriter, r *http.Request) {
 	id, err := s.parseSceneID(r)
 	if err != nil {
@@ -408,6 +521,35 @@ func (s *Server) handleReactiveStart(w http.ResponseWriter, r *http.Request) {
 	// Stop BPM sync if running
 	s.beatSync.Stop()
 
+	// Wake reactive Hue lights via REST — the Entertainment API streams RGB
+	// to lights that are already on but does not turn them on. Fire all wakes
+	// concurrently and don't block the handler; if the bridge is slow or
+	// unreachable, the handler still returns immediately and streaming will
+	// reach any lights that come online.
+	if s.hue != nil {
+		for _, lightID := range s.reactive.HueLights {
+			go func(id string) {
+				if err := s.hue.SetState(id, map[string]any{
+					"on":             true,
+					"bri":             100,
+					"transitiontime": 0,
+				}); err != nil {
+					log.Printf("Hue wake %s failed: %v", id, err)
+				}
+			}(lightID)
+		}
+	}
+
+	// Start Hue Entertainment streaming if available
+	if s.HueStreamer != nil {
+		if err := s.HueStreamer.Start(); err != nil {
+			log.Printf("Hue Entertainment start error (falling back to REST): %v", err)
+		} else {
+			// Swap the reactive engine's Hue setter to use streaming
+			s.reactive.SetHueSetter(s.HueStreamer)
+		}
+	}
+
 	if err := s.reactive.Start(); err != nil {
 		s.writeError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -418,6 +560,14 @@ func (s *Server) handleReactiveStart(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleReactiveStop(w http.ResponseWriter, r *http.Request) {
 	s.reactive.Stop()
+
+	// Stop Hue Entertainment streaming
+	if s.HueStreamer != nil && s.HueStreamer.IsActive() {
+		s.HueStreamer.Stop()
+		// Restore REST API for manual control
+		s.reactive.SetHueSetter(s.hue)
+	}
+
 	s.writeJSON(w, map[string]string{"status": "stopped"})
 }
 

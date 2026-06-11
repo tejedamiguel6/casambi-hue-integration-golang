@@ -134,18 +134,44 @@ func main() {
 	fmt.Println("Authenticated! Ready for light control.")
 
 	if *serve {
-		hue := &api.HueClient{
-			BridgeIP: os.Getenv("HUE_BRIDGE_IP"),
-			Username: os.Getenv("HUE_USERNAME"),
-		}
-		if hue.BridgeIP == "" || hue.Username == "" {
+		bridgeIP := os.Getenv("HUE_BRIDGE_IP")
+		username := os.Getenv("HUE_USERNAME")
+		clientKey := os.Getenv("HUE_CLIENTKEY")
+		entertainmentArea := os.Getenv("HUE_ENTERTAINMENT_AREA")
+
+		if bridgeIP == "" || username == "" {
 			fmt.Println("Set HUE_BRIDGE_IP and HUE_USERNAME environment variables")
 			fmt.Println("  export HUE_BRIDGE_IP=192.168.x.x")
 			fmt.Println("  export HUE_USERNAME=your-hue-username")
 			return
 		}
 
+		// REST client for manual control endpoints
+		hue := &api.HueClient{
+			BridgeIP: bridgeIP,
+			Username: username,
+		}
+
+		// Entertainment streamer for reactive mode (if clientkey available)
+		var streamer *api.HueStreamer
+		if clientKey != "" {
+			if entertainmentArea == "" {
+				fmt.Println("HUE_CLIENTKEY is set but HUE_ENTERTAINMENT_AREA is not")
+				fmt.Println("  export HUE_ENTERTAINMENT_AREA=<entertainment-configuration-id>")
+				fmt.Println("  (find it via: curl -sk https://$HUE_BRIDGE_IP/clip/v2/resource/entertainment_configuration -H \"hue-application-key: $HUE_USERNAME\")")
+			} else {
+				channels := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+				s, err := api.NewHueStreamer(bridgeIP, username, clientKey, entertainmentArea, channels)
+				if err != nil {
+					fmt.Println("Hue Entertainment setup error:", err)
+				} else {
+					streamer = s
+				}
+			}
+		}
+
 		server := api.NewServer(conn, creds, hue, *port)
+		server.HueStreamer = streamer
 		if err := server.Start(); err != nil {
 			fmt.Println("Server error:", err)
 		}

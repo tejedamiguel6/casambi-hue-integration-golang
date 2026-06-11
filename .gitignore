@@ -1,11 +1,11 @@
 # Credentials and user-specific data
+.env
 casambi_credentials.json
 bpm_cache.json
 
-# Internal docs (not for public repo)
-PROGRESS.md
-ROADMAP.md
-OPEN_SOURCE.md
+# Internal docs and notes (not for public repo) — all markdown except README
+*.md
+!README.md
 
 # Binary
 casambi-go
