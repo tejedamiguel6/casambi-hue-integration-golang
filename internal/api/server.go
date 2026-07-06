@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
+	"reflect"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/migueltejeda/casambi-go/internal/audio"
 	"github.com/migueltejeda/casambi-go/internal/ble"
+	"github.com/migueltejeda/casambi-go/internal/config"
 	"github.com/migueltejeda/casambi-go/internal/protocol"
 	"github.com/migueltejeda/casambi-go/internal/spotify"
 )
@@ -19,25 +21,29 @@ import (
 type Server struct {
 	conn        *ble.Connection
 	creds       *NetworkCredentials
-	hue         *HueClient
+	hue         *HueClient // nil when no Hue bridge is configured
 	HueStreamer *HueStreamer
 	beatSync    *spotify.BeatSync
 	reactive    *audio.ReactiveEngine
 	mux         *http.ServeMux
-	port        string
-	seq         uint16 // command sequence counter
+	opts        ServerOptions
+	cfgMu       sync.Mutex // guards opts.Config across settings handlers
+	seq         uint16     // command sequence counter
 }
 
-// SpotifyAPIURL can be overridden via environment variable SPOTIFY_NOW_PLAYING_URL
-var spotifyAPIURL = "https://api-spotify-tracks.mtejeda.co/now-listening-to"
-
-func init() {
-	if url := os.Getenv("SPOTIFY_NOW_PLAYING_URL"); url != "" {
-		spotifyAPIURL = url
-	}
+// ServerOptions carries the user configuration the server needs.
+type ServerOptions struct {
+	Bind                 string // listen address, e.g. "127.0.0.1"
+	Port                 int
+	SpotifyURL           string // now-playing endpoint; "" disables Spotify features
+	ReactiveCasambiUnits []uint16
+	ReactiveHueLights    []string
+	BPMCachePath         string
+	Config               *config.Config // full config, for the settings API (may be nil)
+	ConfigPath           string         // where PUT /api/config persists ("" = default)
 }
 
-func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, port string) *Server {
+func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, opts ServerOptions) *Server {
 	// Casambi send helpers for the reactive engine
 	casambiSend := func(level uint8, unitID uint16) {
 		cmd := protocol.NewSetLevelCommand(level, unitID, protocol.TargetUnit, 0)
@@ -56,20 +62,40 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 		conn.SendCommand(cmd)
 	}
 
+	// A nil *HueClient must not become a non-nil interface value downstream,
+	// so only assign it when a bridge is actually configured.
+	var hueForSync spotify.HueSetter
+	var hueForReactive audio.HueSetter
+	if hue != nil {
+		hueForSync = hue
+		hueForReactive = hue
+	}
+
 	s := &Server{
 		conn:     conn,
 		creds:    creds,
 		hue:      hue,
-		beatSync: spotify.NewBeatSync(conn, hue, spotifyAPIURL),
-		reactive: audio.NewReactiveEngine(hue, casambiSend, casambiState, casambiColor, casambiFullState, spotifyAPIURL),
-		port:     port,
+		beatSync: spotify.NewBeatSync(conn, hueForSync, opts.SpotifyURL, opts.BPMCachePath, opts.ReactiveCasambiUnits, opts.ReactiveHueLights),
+		reactive: audio.NewReactiveEngine(hueForReactive, casambiSend, casambiState, casambiColor, casambiFullState, opts.SpotifyURL, opts.ReactiveCasambiUnits, opts.ReactiveHueLights),
+		opts:     opts,
 		seq:      1,
 	}
 
+	// The now-playing poller runs for the server's lifetime so the dashboard
+	// shows the current track even while reactive mode is off.
+	s.reactive.StartSpotifyPoller()
+
 	mux := http.NewServeMux()
 
+	// Web UI dashboard ({$} = exact root match only)
+	mux.HandleFunc("GET /{$}", s.handleDashboard)
+
+	// Settings (config view/update)
+	mux.HandleFunc("GET /api/config", s.handleGetConfig)
+	mux.HandleFunc("PUT /api/config", s.handleUpdateConfig)
+
 	// Help — shows all endpoints
-	mux.HandleFunc("GET /", s.handleHelp)
+	mux.HandleFunc("GET /api/help", s.handleHelp)
 
 	// Status
 	mux.HandleFunc("GET /api/status", s.handleStatus)
@@ -99,9 +125,11 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 
 	// Audio-reactive lighting
 	mux.HandleFunc("GET /api/reactive/status", s.handleReactiveStatus)
+	mux.HandleFunc("GET /api/reactive/stream", s.handleReactiveStream)
 	mux.HandleFunc("POST /api/reactive/start", s.handleReactiveStart)
 	mux.HandleFunc("POST /api/reactive/stop", s.handleReactiveStop)
 	mux.HandleFunc("POST /api/reactive/gain", s.handleReactiveGain)
+	mux.HandleFunc("POST /api/reactive/autogain", s.handleReactiveAutoGain)
 	mux.HandleFunc("POST /api/reactive/bpm", s.handleReactiveBPM)
 
 	// Hue lights (HTTP to bridge)
@@ -116,32 +144,12 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 }
 
 func (s *Server) Start() error {
-	addr := ":" + s.port
-	fmt.Printf("\nAPI server listening on http://localhost%s\n", addr)
-	fmt.Println("Endpoints:")
-	fmt.Println("  GET  /api/status")
-	fmt.Println("  GET  /api/units                              Casambi units")
-	fmt.Println("  GET  /api/scenes                             Casambi scenes")
-	fmt.Println("  POST /api/units/{id}/on")
-	fmt.Println("  POST /api/units/{id}/off")
-	fmt.Println("  POST /api/units/{id}/level   {\"level\": 0-255}")
-	fmt.Println("  POST /api/units/{id}/state   {\"state\": \"f2ff6097b8\"}")
-	fmt.Println("  POST /api/scenes/{id}/on")
-	fmt.Println("  POST /api/scenes/{id}/off")
-	fmt.Println("  GET  /api/spotify/sync/status                 Spotify sync")
-	fmt.Println("  POST /api/spotify/sync/start   {\"bpm\": 120}")
-	fmt.Println("  POST /api/spotify/sync/stop")
-	fmt.Println("  POST /api/spotify/sync/bpm     {\"bpm\": 140}")
-	fmt.Println("  POST /api/spotify/sync/tap                    Tap tempo")
-	fmt.Println("  GET  /api/reactive/status                     Audio-reactive")
-	fmt.Println("  POST /api/reactive/start")
-	fmt.Println("  POST /api/reactive/stop")
-	fmt.Println("  POST /api/spotify/sync/save                   Save BPM to cache")
-	fmt.Println("  GET  /api/hue/lights                         Hue lights")
-	fmt.Println("  POST /api/hue/lights/{id}/on")
-	fmt.Println("  POST /api/hue/lights/{id}/off")
-	fmt.Println("  POST /api/hue/lights/{id}/color  {\"hue\":0-65535,\"sat\":0-254,\"bri\":0-254}")
-	fmt.Println("  POST /api/hue/lights/{id}/level  {\"level\":0-254}")
+	addr := fmt.Sprintf("%s:%d", s.opts.Bind, s.opts.Port)
+	fmt.Printf("\nWeb dashboard:  http://%s/\n", addr)
+	fmt.Printf("API reference:  http://%s/api/help\n", addr)
+	if s.opts.Bind == "127.0.0.1" || s.opts.Bind == "localhost" {
+		fmt.Println("(listening on this machine only — set server.bind: 0.0.0.0 in the config for LAN access)")
+	}
 	return http.ListenAndServe(addr, s.logMiddleware(s.mux))
 }
 
@@ -190,12 +198,13 @@ func (s *Server) parseSceneID(r *http.Request) (uint16, error) {
 // ── Handlers ──────────────────────────────────────────────
 
 func (s *Server) handleHelp(w http.ResponseWriter, r *http.Request) {
+	port := strconv.Itoa(s.opts.Port)
 	help := map[string]any{
 		"quickstart": map[string]string{
-			"1_start_reactive": "curl -X POST localhost:" + s.port + "/api/reactive/start",
-			"2_set_gain":       "curl -X POST localhost:" + s.port + "/api/reactive/gain -d '{\"gain\": 30}'",
-			"3_check_status":   "curl localhost:" + s.port + "/api/reactive/status",
-			"4_stop":           "curl -X POST localhost:" + s.port + "/api/reactive/stop",
+			"1_start_reactive": "curl -X POST localhost:" + port + "/api/reactive/start",
+			"2_set_gain":       "curl -X POST localhost:" + port + "/api/reactive/gain -d '{\"gain\": 30}'",
+			"3_check_status":   "curl localhost:" + port + "/api/reactive/status",
+			"4_stop":           "curl -X POST localhost:" + port + "/api/reactive/stop",
 		},
 		"endpoints": map[string]any{
 			"status": map[string]string{
@@ -214,10 +223,19 @@ func (s *Server) handleHelp(w http.ResponseWriter, r *http.Request) {
 				"POST /api/scenes/{id}/off": "Deactivate scene",
 			},
 			"audio_reactive": map[string]string{
-				"GET  /api/reactive/status": "Audio analysis + colors",
-				"POST /api/reactive/start":  "Start mic listening",
-				"POST /api/reactive/stop":   "Stop",
-				"POST /api/reactive/gain":   "{\"gain\": 1-500}",
+				"GET  /api/reactive/status":   "Audio analysis + colors",
+				"GET  /api/reactive/stream":   "Live status via SSE (~12Hz)",
+				"POST /api/reactive/start":    "Start mic listening",
+				"POST /api/reactive/stop":     "Stop",
+				"POST /api/reactive/gain":     "{\"gain\": 1-500}",
+				"POST /api/reactive/autogain": "{\"enabled\": true}",
+			},
+			"dashboard": map[string]string{
+				"GET /": "Web UI dashboard",
+			},
+			"settings": map[string]string{
+				"GET /api/config": "Current configuration",
+				"PUT /api/config": "Update configuration (reactive lights + Spotify URL apply live)",
 			},
 			"hue_lights": map[string]string{
 				"GET  /api/hue/lights":            "List all Hue lights",
@@ -527,7 +545,7 @@ func (s *Server) handleReactiveStart(w http.ResponseWriter, r *http.Request) {
 	// unreachable, the handler still returns immediately and streaming will
 	// reach any lights that come online.
 	if s.hue != nil {
-		for _, lightID := range s.reactive.HueLights {
+		for _, lightID := range s.reactive.HueTargets() {
 			go func(id string) {
 				if err := s.hue.SetState(id, map[string]any{
 					"on":             true,
@@ -565,7 +583,9 @@ func (s *Server) handleReactiveStop(w http.ResponseWriter, r *http.Request) {
 	if s.HueStreamer != nil && s.HueStreamer.IsActive() {
 		s.HueStreamer.Stop()
 		// Restore REST API for manual control
-		s.reactive.SetHueSetter(s.hue)
+		if s.hue != nil {
+			s.reactive.SetHueSetter(s.hue)
+		}
 	}
 
 	s.writeJSON(w, map[string]string{"status": "stopped"})
@@ -614,9 +634,81 @@ func (s *Server) handleSyncSave(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]string{"status": "saved"})
 }
 
+// ── Settings Handlers ─────────────────────────────────────
+
+// handleGetConfig returns the config, with the reactive light targets
+// overlaid with what the engine is actually driving right now (they can
+// differ when the config leaves them empty and defaults were applied).
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.opts.Config == nil {
+		s.writeError(w, "settings unavailable (no config attached)", http.StatusServiceUnavailable)
+		return
+	}
+	view := *s.opts.Config
+	view.Reactive.CasambiUnits = s.reactive.CasambiTargets()
+	view.Reactive.HueLights = s.reactive.HueTargets()
+	s.writeJSON(w, view)
+}
+
+// handleUpdateConfig merges the request body over the current config,
+// persists it, and applies what it can without a restart (reactive light
+// targets, Spotify URL). Server bind/port and Hue bridge changes are saved
+// but only take effect on restart.
+func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.opts.Config == nil {
+		s.writeError(w, "settings unavailable (no config attached)", http.StatusServiceUnavailable)
+		return
+	}
+
+	updated := *s.opts.Config
+	if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
+		s.writeError(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if updated.Server.Port < 1 || updated.Server.Port > 65535 {
+		s.writeError(w, "server.port must be 1-65535", http.StatusBadRequest)
+		return
+	}
+	if updated.Server.Bind == "" {
+		updated.Server.Bind = "127.0.0.1"
+	}
+
+	restart := updated.Server != s.opts.Config.Server ||
+		!reflect.DeepEqual(updated.Hue, s.opts.Config.Hue)
+
+	if err := updated.Save(s.opts.ConfigPath); err != nil {
+		s.writeError(w, "save config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	*s.opts.Config = updated
+
+	// Live-apply what doesn't need a restart.
+	s.reactive.SetTargets(updated.Reactive.CasambiUnits, updated.Reactive.HueLights)
+	s.reactive.SetSpotifyURL(updated.Spotify.NowPlayingURL)
+
+	log.Printf("Config updated via API (restart required: %v)", restart)
+	s.writeJSON(w, map[string]any{"status": "saved", "restartRequired": restart})
+}
+
 // ── Hue Handlers ──────────────────────────────────────────
 
+// requireHue writes a 503 and returns false when no Hue bridge is configured.
+func (s *Server) requireHue(w http.ResponseWriter) bool {
+	if s.hue == nil {
+		s.writeError(w, "Hue bridge not configured — run 'casambi-go setup'", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
+}
+
 func (s *Server) handleListHueLights(w http.ResponseWriter, r *http.Request) {
+	if !s.requireHue(w) {
+		return
+	}
 	lights, err := s.hue.ListLights()
 	if err != nil {
 		s.writeError(w, err.Error(), http.StatusInternalServerError)
@@ -626,6 +718,9 @@ func (s *Server) handleListHueLights(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHueLightOn(w http.ResponseWriter, r *http.Request) {
+	if !s.requireHue(w) {
+		return
+	}
 	id := r.PathValue("id")
 	if err := s.hue.SetState(id, map[string]any{"on": true, "bri": 254}); err != nil {
 		s.writeError(w, err.Error(), http.StatusInternalServerError)
@@ -635,6 +730,9 @@ func (s *Server) handleHueLightOn(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHueLightOff(w http.ResponseWriter, r *http.Request) {
+	if !s.requireHue(w) {
+		return
+	}
 	id := r.PathValue("id")
 	if err := s.hue.SetState(id, map[string]any{"on": false}); err != nil {
 		s.writeError(w, err.Error(), http.StatusInternalServerError)
@@ -644,6 +742,9 @@ func (s *Server) handleHueLightOff(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHueLightColor(w http.ResponseWriter, r *http.Request) {
+	if !s.requireHue(w) {
+		return
+	}
 	id := r.PathValue("id")
 	var body struct {
 		Hue int `json:"hue"` // 0-65535
@@ -672,6 +773,9 @@ func (s *Server) handleHueLightColor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHueLightLevel(w http.ResponseWriter, r *http.Request) {
+	if !s.requireHue(w) {
+		return
+	}
 	id := r.PathValue("id")
 	var body struct {
 		Level int `json:"level"` // 0-254

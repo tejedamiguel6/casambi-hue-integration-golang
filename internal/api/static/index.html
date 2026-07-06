@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>casambi-go</title>
+<style>
+  :root {
+    --bg: #0d0d12; --panel: #16161e; --panel2: #1d1d28; --text: #e8e8f0;
+    --dim: #8a8a9a; --accent: #7c5cff; --ok: #3ddc84; --warn: #ffb347;
+    --primary: hsl(270, 60%, 50%); --secondary: hsl(30, 60%, 50%);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, "SF Pro", "Segoe UI", Roboto, sans-serif;
+    padding: 16px; max-width: 760px; margin: 0 auto;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  h1 { font-size: 20px; letter-spacing: .5px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--dim); margin-bottom: 10px; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  #conn { width: 10px; height: 10px; border-radius: 50%; background: #555; transition: background .3s; }
+  #conn.live { background: var(--ok); }
+  .panel { background: var(--panel); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+
+  /* Now playing */
+  #now { display: flex; gap: 14px; align-items: center; }
+  #art {
+    width: 84px; height: 84px; border-radius: 10px; background: var(--panel2);
+    object-fit: cover; flex-shrink: 0; box-shadow: 0 0 24px var(--primary);
+    transition: box-shadow .6s;
+  }
+  #track { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+  #playstate { color: var(--dim); font-size: 13px; }
+  .swatches { display: flex; gap: 8px; margin-top: 8px; }
+  .swatch { width: 26px; height: 26px; border-radius: 6px; transition: background .6s; }
+  #sw1 { background: var(--primary); } #sw2 { background: var(--secondary); }
+
+  /* Visualizer */
+  #viz { display: flex; align-items: flex-end; gap: 14px; height: 130px; }
+  .band { flex: 1; display: flex; flex-direction: column; align-items: center; height: 100%; justify-content: flex-end; }
+  .bar-track { width: 100%; height: 100px; background: var(--panel2); border-radius: 8px; display: flex; align-items: flex-end; overflow: hidden; }
+  .bar { width: 100%; height: 0%; border-radius: 8px 8px 0 0; transition: height 70ms linear; }
+  #bar-bass .bar { background: linear-gradient(180deg, var(--primary), var(--accent)); }
+  #bar-mid .bar { background: linear-gradient(180deg, var(--accent), var(--primary)); }
+  #bar-treble .bar { background: linear-gradient(180deg, var(--secondary), var(--accent)); }
+  .band label { font-size: 11px; color: var(--dim); margin-top: 6px; text-transform: uppercase; letter-spacing: 1px; }
+  #beat {
+    width: 64px; height: 64px; border-radius: 50%; align-self: center;
+    background: var(--panel2); display: flex; align-items: center; justify-content: center;
+    flex-direction: column; flex-shrink: 0;
+  }
+  #beat.hit { background: var(--primary); box-shadow: 0 0 30px var(--primary); }
+  #bpm { font-size: 18px; font-weight: 700; }
+  #beat small { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+  #beat.hit small, #beat.hit #bpm { color: #fff; }
+
+  /* Controls */
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button {
+    background: var(--panel2); color: var(--text); border: 0; border-radius: 10px;
+    padding: 10px 16px; font-size: 15px; font-weight: 600; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button:active { transform: scale(.97); }
+  button.big { flex: 1; padding: 14px; font-size: 16px; }
+  button.on { background: var(--ok); color: #06281a; }
+  button.small { padding: 7px 12px; font-size: 13px; }
+  button.auto.active { background: var(--accent); color: #fff; }
+  input[type=range] { flex: 1; accent-color: var(--accent); min-width: 120px; height: 28px; }
+  input[type=number] {
+    background: var(--panel2); color: var(--text); border: 0; border-radius: 8px;
+    padding: 8px; width: 70px; font-size: 15px;
+  }
+  .ctl-label { font-size: 13px; color: var(--dim); width: 44px; }
+  .val { font-size: 13px; width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* Lights */
+  .light { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid #ffffff0d; }
+  .light:last-child { border-bottom: 0; }
+  .light .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .light .name small { color: var(--dim); }
+  .unreachable { opacity: .4; }
+  #scenes { display: flex; gap: 8px; flex-wrap: wrap; }
+  .muted { color: var(--dim); font-size: 13px; }
+
+  /* Settings */
+  h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); margin: 14px 0 6px; }
+  .panel h3:first-of-type { margin-top: 0; }
+  .chk { display: flex; gap: 10px; align-items: center; padding: 7px 0; cursor: pointer; }
+  .chk input { accent-color: var(--accent); width: 18px; height: 18px; flex-shrink: 0; }
+  input[type=text], input[type=url] {
+    background: var(--panel2); color: var(--text); border: 0; border-radius: 8px;
+    padding: 9px; width: 100%; font-size: 14px;
+  }
+  #save-status { margin-top: 8px; min-height: 18px; }
+  #save-status.ok { color: var(--ok); }
+  #save-status.warn { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<header>
+  <div id="conn" title="live connection"></div>
+  <h1>casambi-go</h1>
+  <span class="muted" id="beats" style="margin-left:auto"></span>
+</header>
+
+<div class="panel" id="now">
+  <img id="art" alt="" src="">
+  <div style="min-width:0">
+    <div id="track">No track</div>
+    <div id="playstate">—</div>
+    <div class="swatches"><div class="swatch" id="sw1"></div><div class="swatch" id="sw2"></div></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Audio</h2>
+  <div id="viz">
+    <div class="band" id="bar-bass"><div class="bar-track"><div class="bar"></div></div><label>Bass</label></div>
+    <div class="band" id="bar-mid"><div class="bar-track"><div class="bar"></div></div><label>Mid</label></div>
+    <div class="band" id="bar-treble"><div class="bar-track"><div class="bar"></div></div><label>Treble</label></div>
+    <div id="beat"><span id="bpm">—</span><small>bpm</small></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Reactive Mode</h2>
+  <div class="row" style="margin-bottom:12px">
+    <button class="big" id="toggle">Start</button>
+  </div>
+  <div class="row" style="margin-bottom:10px">
+    <span class="ctl-label">Gain</span>
+    <input type="range" id="gain" min="1" max="200" value="10">
+    <span class="val" id="gainval">10</span>
+    <button class="small auto" id="autogain">Auto</button>
+  </div>
+  <div class="row">
+    <span class="ctl-label">BPM</span>
+    <input type="number" id="bpmin" min="30" max="300" placeholder="120">
+    <button class="small" id="bpmset">Set</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Scenes</h2>
+  <div id="scenes" class="muted">Loading…</div>
+</div>
+
+<div class="panel">
+  <h2>Casambi Units</h2>
+  <div id="units" class="muted">Loading…</div>
+</div>
+
+<div class="panel">
+  <h2>Hue Lights</h2>
+  <div id="hue" class="muted">Loading…</div>
+</div>
+
+<div class="panel">
+  <h2>Settings</h2>
+  <h3>Reactive lights — Casambi</h3>
+  <div id="set-units" class="muted">Loading…</div>
+  <h3>Reactive lights — Hue</h3>
+  <div id="set-hue" class="muted">Loading…</div>
+  <h3>Spotify now-playing URL</h3>
+  <input type="url" id="set-spotify" placeholder="https://… (empty = track info disabled)">
+  <h3>Server (applies after restart)</h3>
+  <label class="chk"><input type="checkbox" id="set-lan"><span>Allow other devices on the network (no auth)</span></label>
+  <div class="row" style="margin-top:4px">
+    <span class="ctl-label">Port</span>
+    <input type="number" id="set-port" min="1" max="65535" value="8080">
+  </div>
+  <div class="row" style="margin-top:14px">
+    <button class="big" id="save-settings">Save settings</button>
+  </div>
+  <div class="muted" id="save-status"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const post = (path, body) => fetch(path, {method: 'POST', body: body ? JSON.stringify(body) : null});
+
+// Hue HSV (hue 0-65535, sat 0-254) → CSS hsl()
+const css = c => `hsl(${Math.round(c.hue / 65535 * 360)}, ${Math.round(c.sat / 254 * 100)}%, 55%)`;
+
+let running = false, gainDragging = false;
+
+// ── Live stream (SSE) ─────────────────────────────────────
+function connect() {
+  const es = new EventSource('/api/reactive/stream');
+  es.onopen = () => $('conn').classList.add('live');
+  es.onerror = () => { $('conn').classList.remove('live'); es.close(); setTimeout(connect, 2000); };
+  es.onmessage = e => render(JSON.parse(e.data));
+}
+
+function render(st) {
+  running = st.running;
+  const t = $('toggle');
+  t.textContent = running ? 'Stop' : 'Start';
+  t.classList.toggle('on', running);
+
+  for (const band of ['bass', 'mid', 'treble'])
+    $('bar-' + band).querySelector('.bar').style.height = Math.min(100, st[band] * 100) + '%';
+
+  $('beat').classList.toggle('hit', st.onBeat);
+  $('bpm').textContent = st.bpm > 0 ? Math.round(st.bpm) : '—';
+  $('beats').textContent = st.beats > 0 ? st.beats + ' beats' : '';
+
+  $('track').textContent = st.track || 'No track';
+  $('playstate').textContent = !st.track ? '—' : (st.paused ? 'Paused' : 'Playing');
+
+  if (st.colors) {
+    document.documentElement.style.setProperty('--primary', css(st.colors.Primary));
+    document.documentElement.style.setProperty('--secondary', css(st.colors.Secondary));
+    if ($('art').src !== st.colors.ImageURL) $('art').src = st.colors.ImageURL;
+  }
+
+  if (!gainDragging) { $('gain').value = Math.min(200, st.gain); $('gainval').textContent = st.gain; }
+  $('autogain').classList.toggle('active', st.autoGain);
+}
+
+// ── Controls ──────────────────────────────────────────────
+$('toggle').onclick = () => post(running ? '/api/reactive/stop' : '/api/reactive/start');
+$('gain').oninput = () => { gainDragging = true; $('gainval').textContent = $('gain').value; };
+$('gain').onchange = () => { post('/api/reactive/gain', {gain: +$('gain').value}); gainDragging = false; };
+$('autogain').onclick = () => post('/api/reactive/autogain', {enabled: true});
+$('bpmset').onclick = () => { const v = +$('bpmin').value; if (v >= 30 && v <= 300) post('/api/reactive/bpm', {bpm: v}); };
+
+// ── Lights & scenes (loaded once) ─────────────────────────
+function lightRow(name, sub, buttons) {
+  const div = document.createElement('div');
+  div.className = 'light';
+  div.innerHTML = `<span class="name">${name} ${sub ? `<small>${sub}</small>` : ''}</span>`;
+  for (const [label, fn] of buttons) {
+    const b = document.createElement('button');
+    b.className = 'small'; b.textContent = label; b.onclick = fn;
+    div.appendChild(b);
+  }
+  return div;
+}
+
+async function loadLights() {
+  try {
+    const units = await (await fetch('/api/units')).json();
+    $('units').textContent = '';
+    for (const u of units || [])
+      $('units').appendChild(lightRow(u.name, `#${u.id}`, [
+        ['On', () => post(`/api/units/${u.id}/on`)],
+        ['50%', () => post(`/api/units/${u.id}/level`, {level: 128})],
+        ['Off', () => post(`/api/units/${u.id}/off`)],
+      ]));
+  } catch { $('units').textContent = 'Unavailable'; }
+
+  try {
+    const scenes = await (await fetch('/api/scenes')).json();
+    $('scenes').textContent = '';
+    for (const sc of scenes || []) {
+      const b = document.createElement('button');
+      b.className = 'small'; b.textContent = sc.name;
+      b.onclick = () => post(`/api/scenes/${sc.id}/on`);
+      $('scenes').appendChild(b);
+    }
+  } catch { $('scenes').textContent = 'Unavailable'; }
+
+  try {
+    const resp = await fetch('/api/hue/lights');
+    if (resp.status === 503) { $('hue').textContent = 'No Hue bridge configured'; return; }
+    const lights = await resp.json();
+    $('hue').textContent = '';
+    for (const l of lights || []) {
+      const row = lightRow(l.name, l.reachable ? '' : 'unreachable', [
+        ['On', () => post(`/api/hue/lights/${l.id}/on`)],
+        ['Off', () => post(`/api/hue/lights/${l.id}/off`)],
+      ]);
+      if (!l.reachable) row.classList.add('unreachable');
+      $('hue').appendChild(row);
+    }
+  } catch { $('hue').textContent = 'Unavailable'; }
+}
+
+// ── Settings ──────────────────────────────────────────────
+function chkRow(container, cls, value, name, sub, checked) {
+  const label = document.createElement('label');
+  label.className = 'chk';
+  const input = document.createElement('input');
+  input.type = 'checkbox'; input.className = cls; input.value = value; input.checked = checked;
+  const span = document.createElement('span');
+  span.className = 'name';
+  span.textContent = name;
+  if (sub) { const small = document.createElement('small'); small.textContent = ' ' + sub; span.appendChild(small); }
+  label.append(input, span);
+  container.appendChild(label);
+}
+
+async function loadSettings() {
+  let cfg;
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) throw 0;
+    cfg = await r.json();
+  } catch {
+    $('save-status').textContent = 'Settings unavailable';
+    return;
+  }
+  $('set-spotify').value = cfg.spotify?.now_playing_url || '';
+  $('set-lan').checked = cfg.server?.bind === '0.0.0.0';
+  $('set-port').value = cfg.server?.port || 8080;
+
+  const selUnits = new Set((cfg.reactive?.casambi_units || []).map(String));
+  const selHue = new Set(cfg.reactive?.hue_lights || []);
+
+  try {
+    const units = await (await fetch('/api/units')).json();
+    $('set-units').textContent = '';
+    for (const u of (units || []).sort((a, b) => a.id - b.id))
+      chkRow($('set-units'), 'set-unit', u.id, u.name, `#${u.id}`, selUnits.has(String(u.id)));
+  } catch { $('set-units').textContent = 'Unavailable'; }
+
+  try {
+    const r = await fetch('/api/hue/lights');
+    if (r.status === 503) { $('set-hue').textContent = 'No Hue bridge configured'; return; }
+    const lights = await r.json();
+    $('set-hue').textContent = '';
+    for (const l of (lights || []).sort((a, b) => +a.id - +b.id))
+      chkRow($('set-hue'), 'set-huelight', l.id, l.name, l.reachable ? `#${l.id}` : `#${l.id} · unreachable`, selHue.has(l.id));
+  } catch { $('set-hue').textContent = 'Unavailable'; }
+}
+
+$('save-settings').onclick = async () => {
+  const status = $('save-status');
+  status.className = 'muted';
+  status.textContent = 'Saving…';
+  const body = {
+    server: {
+      bind: $('set-lan').checked ? '0.0.0.0' : '127.0.0.1',
+      port: +$('set-port').value || 8080,
+    },
+    spotify: { now_playing_url: $('set-spotify').value.trim() },
+    reactive: {
+      casambi_units: [...document.querySelectorAll('.set-unit:checked')].map(c => +c.value),
+      hue_lights: [...document.querySelectorAll('.set-huelight:checked')].map(c => c.value),
+    },
+  };
+  try {
+    const r = await fetch('/api/config', {method: 'PUT', body: JSON.stringify(body)});
+    const res = await r.json();
+    if (!r.ok) { status.textContent = 'Error: ' + (res.error || r.status); return; }
+    status.className = 'muted ' + (res.restartRequired ? 'warn' : 'ok');
+    status.textContent = res.restartRequired
+      ? 'Saved — restart the server to apply the port/network change'
+      : 'Saved ✓ (applied live)';
+  } catch (e) { status.textContent = 'Error: ' + e; }
+};
+
+connect();
+loadLights();
+loadSettings();
+</script>
+</body>
+</html>

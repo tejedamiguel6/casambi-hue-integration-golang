@@ -8,34 +8,39 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-const credsCacheFile = "casambi_credentials.json"
-
 // SaveCredentials writes credentials to a local JSON file so we
 // never need to call the cloud API again.
-func SaveCredentials(creds *NetworkCredentials) error {
+func SaveCredentials(creds *NetworkCredentials, path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(creds, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(credsCacheFile, data, 0600)
+	return os.WriteFile(path, data, 0600)
 }
 
-// LoadCachedCredentials loads credentials from the cache file.
-// Returns nil if the file doesn't exist.
-func LoadCachedCredentials() *NetworkCredentials {
-	data, err := os.ReadFile(credsCacheFile)
-	if err != nil {
-		return nil
+// LoadCachedCredentials loads credentials from the first path that has them.
+// Returns nil if none exists.
+func LoadCachedCredentials(paths ...string) *NetworkCredentials {
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var creds NetworkCredentials
+		if err := json.Unmarshal(data, &creds); err != nil {
+			continue
+		}
+		return &creds
 	}
-	var creds NetworkCredentials
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return nil
-	}
-	return &creds
+	return nil
 }
 
 const casambiAPIBase = "https://api.casambi.com"
@@ -98,11 +103,27 @@ func FetchCredentialsWithNetworkID(networkID string, password string) (*NetworkC
 	fmt.Printf("  Session token: %s...\n", session.Token[:16])
 	fmt.Printf("  Key ID: %d, Role: %d\n", session.KeyID, session.Role)
 
-	// Step 3: Fetch network config (AES keys + units)
+	// Step 3: Fetch network config (AES keys + units).
+	// The phone-gateway-backed config endpoint sometimes returns a partial
+	// response with an empty unit list — retry a few times before accepting it.
 	fmt.Println("Step 3: Fetching network config...")
-	config, err := getNetworkConfig(networkID, session.Token)
-	if err != nil {
-		return nil, fmt.Errorf("get network config: %w", err)
+	var config *networkConfig
+	for attempt := 1; attempt <= 3; attempt++ {
+		config, err = getNetworkConfig(networkID, session.Token)
+		if err != nil {
+			return nil, fmt.Errorf("get network config: %w", err)
+		}
+		if len(config.Units) > 0 {
+			break
+		}
+		if attempt < 3 {
+			fmt.Printf("  Config came back with no units (gateway hiccup?) — retry %d/3...\n", attempt+1)
+			time.Sleep(3 * time.Second)
+		}
+	}
+	if len(config.Units) == 0 {
+		fmt.Println("  WARNING: the network config lists no units. Make sure the Casambi")
+		fmt.Println("  app is open in the foreground and re-run if your lights are missing.")
 	}
 
 	// Find the AES key matching our keyID

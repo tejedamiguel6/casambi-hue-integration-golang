@@ -50,17 +50,17 @@ type BeatSync struct {
 	BrightLow    int      // trough brightness
 }
 
-func NewBeatSync(conn *ble.Connection, hue HueSetter, apiURL string) *BeatSync {
+func NewBeatSync(conn *ble.Connection, hue HueSetter, apiURL, bpmCachePath string, casambiUnits []uint16, hueLights []string) *BeatSync {
 	return &BeatSync{
 		conn:         conn,
 		hue:          hue,
 		apiURL:       apiURL,
-		bpmCache:     LoadBPMCache(),
+		bpmCache:     LoadBPMCache(bpmCachePath),
 		bpm:          120,
 		BrightHigh:   254,
 		BrightLow:    30,
-		CasambiUnits: []uint16{1, 4},
-		HueLights:    []string{"19", "20", "23", "31"},
+		CasambiUnits: casambiUnits,
+		HueLights:    hueLights,
 	}
 }
 
@@ -103,6 +103,9 @@ func (bs *BeatSync) estimateProgress() int {
 
 // Start begins beat-reactive lighting.
 func (bs *BeatSync) Start(bpm float64) error {
+	if bs.apiURL == "" {
+		return fmt.Errorf("Spotify now-playing URL not configured — run 'casambi-go setup' or set SPOTIFY_NOW_PLAYING_URL")
+	}
 	bs.mu.Lock()
 	if bs.running {
 		bs.mu.Unlock()

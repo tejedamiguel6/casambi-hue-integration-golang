@@ -1,8 +1,6 @@
 module github.com/migueltejeda/casambi-go
 
-go 1.24.0
-
-toolchain go1.24.5
+go 1.25.0
 
 require tinygo.org/x/bluetooth v0.10.0
 
@@ -21,5 +19,7 @@ require (
 	github.com/tinygo-org/pio v0.0.0-20231216154340-cd888eb58899 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/exp v0.0.0-20230728194245-b0cb94b80691 // indirect
-	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/term v0.44.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

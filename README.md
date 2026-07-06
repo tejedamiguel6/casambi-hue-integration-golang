@@ -23,44 +23,41 @@ casambi-go bridges two lighting ecosystems into one system: it speaks the (rever
 
 ## Setup
 
-### 1. Casambi credentials
-
-Fetch and cache your network credentials from the Casambi cloud (one time; open the Casambi app on your phone first so the network gateway is awake):
+One command:
 
 ```bash
-go run . --fetch-creds --password '<your-network-password>' --network '<your-network-id>'
+go run . setup
 ```
 
-Credentials are cached in `casambi_credentials.json` (gitignored) — subsequent runs work fully offline.
+The wizard scans for your Casambi network, fetches and caches your credentials from the Casambi cloud (open the Casambi app on your phone first so the network gateway is awake), lets you pick which lights react to music, optionally pairs a Philips Hue bridge (automatic discovery + link-button registration + Entertainment area selection), and writes everything to `~/.config/casambi-go/config.yaml`:
 
-### 2. Philips Hue (optional)
+```yaml
+server:
+  bind: 127.0.0.1   # 0.0.0.0 exposes the dashboard to your LAN (no auth!)
+  port: 8080
+casambi:
+  network_id: <your-network-id>
+hue:
+  bridge_ip: 192.168.x.x            # empty = Casambi-only, Hue disabled
+  username: <hue-application-key>
+  clientkey: <entertainment-psk>    # enables 25 Hz DTLS streaming
+  entertainment_area: <config-id>
+spotify:
+  now_playing_url: <url>            # optional, enables album-art colors
+reactive:
+  casambi_units: [1, 4]             # which lights react to music
+  hue_lights: ["6", "19"]
+```
 
-Register with the bridge (press the link button, then request a username with `generateclientkey: true` to also get the Entertainment PSK), and create an Entertainment Area in the Hue app (Settings → Entertainment Areas).
+Credentials are cached next to the config in `credentials.json` — after setup, light control works fully offline. The config file is safe to edit by hand, and the old `HUE_*` / `SPOTIFY_NOW_PLAYING_URL` environment variables still override it.
 
-Put the results in a `.env` file (gitignored):
+### Run
 
 ```bash
-HUE_BRIDGE_IP=192.168.x.x
-HUE_USERNAME=<hue-application-key>
-HUE_CLIENTKEY=<entertainment-psk-hex>          # optional, enables 25 Hz streaming
-HUE_ENTERTAINMENT_AREA=<entertainment-config-id>  # required with HUE_CLIENTKEY
-SPOTIFY_NOW_PLAYING_URL=<url>                  # optional, enables album art colors
+go run . serve
 ```
 
-To find your entertainment configuration ID:
-
-```bash
-curl -sk https://$HUE_BRIDGE_IP/clip/v2/resource/entertainment_configuration \
-  -H "hue-application-key: $HUE_USERNAME"
-```
-
-### 3. Run
-
-```bash
-export $(cat .env | xargs) && go run . --serve --port 8080
-```
-
-The server scans for your Casambi network, performs the key exchange and authentication, and starts the REST API.
+The server scans for your Casambi network, performs the key exchange and authentication, and starts the REST API + web dashboard.
 
 ## Usage
 

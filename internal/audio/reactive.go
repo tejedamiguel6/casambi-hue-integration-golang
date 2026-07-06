@@ -81,8 +81,11 @@ type ReactiveEngine struct {
 	colors    *DominantColors
 	trackName string
 
-	// Spotify integration for album art + track info
+	// Spotify integration for album art + track info. The poller runs for
+	// the server's lifetime (not the engine's) so the dashboard shows the
+	// current track even when reactive mode is off.
 	spotifyURL       string
+	pollerOnce       sync.Once
 	bpm              float64
 	progress         int       // ms from Spotify
 	lastPollProgress int
@@ -143,15 +146,15 @@ func openBlackHoleStream(buf []float32) (*portaudio.Stream, []float32, error) {
 	return nil, nil, fmt.Errorf("BlackHole 2ch device not found")
 }
 
-func NewReactiveEngine(hue HueSetter, casambiSend func(level uint8, unitID uint16), casambiState func(state []byte, unitID uint16), casambiColor func(hue uint16, sat uint8, unitID uint16), casambiFullState func(dimmer uint8, hue uint16, sat uint8, white uint8, temp uint8, unitID uint16), spotifyURL string) *ReactiveEngine {
+func NewReactiveEngine(hue HueSetter, casambiSend func(level uint8, unitID uint16), casambiState func(state []byte, unitID uint16), casambiColor func(hue uint16, sat uint8, unitID uint16), casambiFullState func(dimmer uint8, hue uint16, sat uint8, white uint8, temp uint8, unitID uint16), spotifyURL string, casambiUnits []uint16, hueLights []string) *ReactiveEngine {
 	return &ReactiveEngine{
 		hue:              hue,
 		casambiSend:      casambiSend,
 		casambiState:     casambiState,
 		casambiColor:     casambiColor,
 		casambiFullState: casambiFullState,
-		CasambiUnits:     []uint16{1, 4},
-		HueLights:        []string{"6", "19", "20", "23", "25", "31"},
+		CasambiUnits:     casambiUnits,
+		HueLights:        hueLights,
 		Gain:             10,
 		autoGain:         true,
 		effectiveGain:    10,
@@ -199,6 +202,7 @@ func (re *ReactiveEngine) SetAlbumColors(trackName, imageURL string) {
 
 	re.mu.Lock()
 	re.colors = colors
+	running := re.running
 	re.mu.Unlock()
 	log.Printf("Album colors: %s → primary hue=%d sat=%d, secondary hue=%d sat=%d",
 		trackName, colors.Primary.Hue, colors.Primary.Sat, colors.Secondary.Hue, colors.Secondary.Sat)
@@ -206,7 +210,10 @@ func (re *ReactiveEngine) SetAlbumColors(trackName, imageURL string) {
 	// Push the new primary color to Casambi units once via SetColor (opcode 7).
 	// Per-beat SetLevel handles brightness; color only changes on track change,
 	// so back-to-back state writes (which the fixture silently drops) are avoided.
-	go re.pushCasambiColor(colors.Primary)
+	// Only while reactive mode is running — the poller alone must not touch lights.
+	if running {
+		go re.pushCasambiColor(colors.Primary)
+	}
 }
 
 // pushCasambiColor sends a SetColor (opcode 7) packet to each Casambi unit with
@@ -217,7 +224,7 @@ func (re *ReactiveEngine) pushCasambiColor(c HSV) {
 	}
 	hue1023 := uint16(float64(c.Hue) / 65535.0 * 1023)
 	sat255 := uint8(float64(c.Sat) / 254.0 * 255)
-	for i, unitID := range re.CasambiUnits {
+	for i, unitID := range re.CasambiTargets() {
 		if i > 0 {
 			time.Sleep(80 * time.Millisecond)
 		}
@@ -238,8 +245,9 @@ func (re *ReactiveEngine) beatColorPulse(c HSV) {
 	// Shift hue ~90° (256 of 1024 = 90° of 360°)
 	shiftedHue := uint16((int(primaryHue) + 256) % 1024)
 
+	units := re.CasambiTargets()
 	// Pulse to shifted color
-	for i, unitID := range re.CasambiUnits {
+	for i, unitID := range units {
 		if i > 0 {
 			time.Sleep(80 * time.Millisecond)
 		}
@@ -248,7 +256,7 @@ func (re *ReactiveEngine) beatColorPulse(c HSV) {
 	// Hold the flash briefly
 	time.Sleep(180 * time.Millisecond)
 	// Revert to album primary
-	for i, unitID := range re.CasambiUnits {
+	for i, unitID := range units {
 		if i > 0 {
 			time.Sleep(80 * time.Millisecond)
 		}
@@ -282,6 +290,41 @@ func (re *ReactiveEngine) SetHueSetter(hue HueSetter) {
 	re.mu.Lock()
 	re.hue = hue
 	re.mu.Unlock()
+}
+
+// StartSpotifyPoller launches the now-playing poller for the process
+// lifetime. Safe to call more than once; the loop idles while no URL is set.
+func (re *ReactiveEngine) StartSpotifyPoller() {
+	re.pollerOnce.Do(func() { go re.pollSpotify() })
+}
+
+// SetSpotifyURL updates the now-playing endpoint at runtime.
+func (re *ReactiveEngine) SetSpotifyURL(url string) {
+	re.mu.Lock()
+	re.spotifyURL = url
+	re.mu.Unlock()
+}
+
+// SetTargets replaces the set of lights reactive mode drives.
+func (re *ReactiveEngine) SetTargets(casambiUnits []uint16, hueLights []string) {
+	re.mu.Lock()
+	re.CasambiUnits = append([]uint16(nil), casambiUnits...)
+	re.HueLights = append([]string(nil), hueLights...)
+	re.mu.Unlock()
+}
+
+// CasambiTargets returns a copy of the Casambi units reactive mode drives.
+func (re *ReactiveEngine) CasambiTargets() []uint16 {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	return append([]uint16(nil), re.CasambiUnits...)
+}
+
+// HueTargets returns a copy of the Hue lights reactive mode drives.
+func (re *ReactiveEngine) HueTargets() []string {
+	re.mu.Lock()
+	defer re.mu.Unlock()
+	return append([]string(nil), re.HueLights...)
 }
 
 func (re *ReactiveEngine) SetAutoGain(enabled bool) {
@@ -325,7 +368,14 @@ func (re *ReactiveEngine) Start() error {
 
 	re.running = true
 	re.stopCh = make(chan struct{})
+	colors := re.colors
 	re.mu.Unlock()
+
+	// The poller may already know the track (it runs even while stopped) —
+	// apply its album color now, since color pushes are gated on running.
+	if colors != nil {
+		go re.pushCasambiColor(colors.Primary)
+	}
 
 	go re.run()
 	return nil
@@ -403,9 +453,6 @@ func (re *ReactiveEngine) run() {
 	defer stream.Stop()
 
 	log.Println("Audio-reactive engine started (hybrid: Spotify timing + mic intensity)")
-
-	// Start Spotify poller for progress + album art
-	go re.pollSpotify()
 
 	for {
 		select {
@@ -523,20 +570,19 @@ func (re *ReactiveEngine) pollSpotify() {
 		} `json:"data"`
 	}
 
+	// Runs for the process lifetime (see StartSpotifyPoller); idles when no
+	// URL is configured so the URL can be set later via the settings API.
 	var lastTrack string
 	for {
-		select {
-		case <-re.stopCh:
-			return
-		default:
-		}
-
-		if re.spotifyURL == "" {
+		re.mu.Lock()
+		url := re.spotifyURL
+		re.mu.Unlock()
+		if url == "" {
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
-		resp, err := http.Get(re.spotifyURL)
+		resp, err := http.Get(url)
 		if err != nil {
 			time.Sleep(2 * time.Second)
 			continue
@@ -683,9 +729,11 @@ func (re *ReactiveEngine) medianInterval() float64 {
 }
 
 func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bool) {
-	// Apply gain to boost audio input
+	// Apply gain to boost audio input; snapshot light targets (mutable via settings)
 	re.mu.Lock()
 	gain := re.effectiveGain
+	casambiUnits := append([]uint16(nil), re.CasambiUnits...)
+	hueLights := append([]string(nil), re.HueLights...)
 	re.mu.Unlock()
 	rms = rms * gain
 	bass = bass * gain
@@ -727,7 +775,7 @@ func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bo
 	if shouldSendCasambi && re.casambiSend != nil {
 		re.lastCasambiBri = casambiBri
 		re.lastCmdTime = now
-		for i, unitID := range re.CasambiUnits {
+		for i, unitID := range casambiUnits {
 			if i > 0 {
 				time.Sleep(25 * time.Millisecond) // space writes across units
 			}
@@ -789,11 +837,14 @@ func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bo
 	if hueBriDelta < 0 {
 		hueBriDelta = -hueBriDelta
 	}
-	shouldSendHue := isBeat || hueBriDelta > 20 || now.Sub(re.lastCmdTime) > 150*time.Millisecond
+	re.mu.Lock()
+	hue := re.hue
+	re.mu.Unlock()
+	shouldSendHue := hue != nil && (isBeat || hueBriDelta > 20 || now.Sub(re.lastCmdTime) > 150*time.Millisecond)
 	if shouldSendHue {
 		re.lastHueBri = hueBri
-		for _, lightID := range re.HueLights {
-			go re.hue.SetState(lightID, map[string]any{
+		for _, lightID := range hueLights {
+			go hue.SetState(lightID, map[string]any{
 				"on":             true,
 				"hue":            hueColor % 65536,
 				"sat":            hueSat,

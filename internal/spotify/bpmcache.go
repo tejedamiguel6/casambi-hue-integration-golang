@@ -8,18 +8,17 @@ import (
 	"sync"
 )
 
-const bpmCacheFile = "bpm_cache.json"
-
 // BPMCache persists track→BPM mappings to disk.
 type BPMCache struct {
 	mu      sync.Mutex
+	path    string
 	entries map[string]float64 // "track — artist" → BPM
 }
 
-func LoadBPMCache() *BPMCache {
-	c := &BPMCache{entries: make(map[string]float64)}
+func LoadBPMCache(path string) *BPMCache {
+	c := &BPMCache{path: path, entries: make(map[string]float64)}
 
-	data, err := os.ReadFile(bpmCacheFile)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return c
 	}
@@ -48,8 +47,9 @@ func (c *BPMCache) Set(track, artist string, bpm float64) {
 func (c *BPMCache) save() {
 	c.mu.Lock()
 	data, _ := json.MarshalIndent(c.entries, "", "  ")
+	path := c.path
 	c.mu.Unlock()
-	os.WriteFile(bpmCacheFile, data, 0644)
+	os.WriteFile(path, data, 0600)
 }
 
 // All returns all cached entries.
