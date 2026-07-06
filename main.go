@@ -213,6 +213,7 @@ func main() {
 			ReactiveCasambiUnits: reactiveUnits,
 			ReactiveHueLights:    cfg.Reactive.HueLights,
 			BPMCachePath:         config.BPMCachePath(),
+			ProfileStorePath:     config.ProfileStorePath(),
 			Config:               cfg,
 			ConfigPath:           *configPath,
 		})

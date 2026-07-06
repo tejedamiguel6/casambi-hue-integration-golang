@@ -9,6 +9,8 @@ casambi-go bridges two lighting ecosystems into one system: it speaks the (rever
 - **Casambi BLE control** — full protocol implementation: ECDH P-256 key exchange, Casambi's custom AES-CTR encryption, RFC 4493 CMAC authentication, and command packets (brightness, color, scenes). No official API key required (Casambi discontinued their consumer API program in 2025).
 - **Philips Hue control** — REST API for manual control, plus the Entertainment API (DTLS/UDP streaming) for low-latency reactive mode.
 - **Real-time audio analysis** — microphone or system-audio capture via portaudio, pure-Go FFT, spectral flux beat detection (real onsets, not a fixed BPM metronome), predictive beat timing that fires commands early to compensate for BLE latency, and auto-gain that adapts to volume and mic distance.
+- **Song analyzer** — a pure-Go replacement for Spotify's dead audio-features API. The first time a track plays, its audio is analyzed offline: tempo + beat grid (autocorrelation over the onset envelope, anchored to Spotify `progress_ms`), energy and dynamics, key/mode (Krumhansl-Schmuckler chromagram matching), plus danceability, valence, and brightness scores. The profile is cached in `track_profiles.json`, so every later play gets instant BPM and mood without re-listening. Legacy `bpm_cache.json` entries (tap tempo) are imported automatically and upgraded to full profiles as tracks replay.
+- **AI track enrichment (optional)** — with an Anthropic API key configured, each analyzed track gets one small Claude API call adding what DSP can't measure: genre and mood tags, refined valence/danceability/energy, a color palette matched to the song's character, a pulse style (strobe / pulse / wash / breathe) that tunes how hard the lights hit, an intensity bias, and — for tracks Claude knows — song structure notes (builds, drops). The engine applies the lighting direction live: pulse style sets brightness decay and color-flash pacing, and the AI palette covers tracks whose album art yields no usable colors. Everything is cached in the same profile, so it's one API call per new song, ever.
 - **Album art color extraction** — when the track changes, the current album cover is downloaded and its two dominant vibrant colors drive the light palette. A dark hip-hop record gets deep purples; a bright pop album gets warm oranges.
 - **REST API** — everything is controllable over HTTP from any device on your network. `GET /` returns a self-documenting endpoint list with curl examples.
 - **Single binary** — cross-compiles to a Raspberry Pi sitting next to your lights.
@@ -47,6 +49,9 @@ spotify:
 reactive:
   casambi_units: [1, 4]             # which lights react to music
   hue_lights: ["6", "19"]
+ai:
+  anthropic_api_key: <key>          # optional, enables AI track enrichment
+  model: claude-haiku-4-5           # default; any Claude model works
 ```
 
 Credentials are cached next to the config in `credentials.json` — after setup, light control works fully offline. The config file is safe to edit by hand, and the old `HUE_*` / `SPOTIFY_NOW_PLAYING_URL` environment variables still override it.
@@ -73,6 +78,19 @@ curl -X POST localhost:8080/api/reactive/gain -d '{"gain": 30}'
 
 # Stop:
 curl -X POST localhost:8080/api/reactive/stop
+
+# Song analyzer — profiling progress + the current track's profile
+# (BPM, beat phase, energy, key, danceability, valence):
+curl localhost:8080/api/analyzer/status
+
+# All cached track profiles:
+curl localhost:8080/api/analyzer/profiles
+
+# Re-analyze the current track from scratch:
+curl -X POST localhost:8080/api/analyzer/reanalyze
+
+# Re-run AI enrichment for the current track (needs ai.anthropic_api_key):
+curl -X POST localhost:8080/api/analyzer/enrich
 
 # Direct control:
 curl -X POST localhost:8080/api/units/1/on
@@ -113,6 +131,7 @@ The Casambi protocol work follows the trail blazed by [casambi-bt](https://githu
 │   ├── protocol/            Packet encoding, opcodes, fixture state packing
 │   ├── api/                 Casambi cloud API, REST server, Hue REST + Entertainment clients
 │   ├── audio/               Reactive engine: capture, FFT, beat detection, color mapping
+│   ├── analyzer/            Song analyzer: tempo/beat grid, energy, key/mood, profile cache
 │   └── spotify/             Now-playing polling, BPM cache
 ```
 

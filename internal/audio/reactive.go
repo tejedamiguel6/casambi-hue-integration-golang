@@ -7,10 +7,12 @@ import (
 	"math"
 	"math/cmplx"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gordonklaus/portaudio"
+	"github.com/migueltejeda/casambi-go/internal/analyzer"
 )
 
 // HueSetter abstracts Hue bridge control.
@@ -29,6 +31,7 @@ type ReactiveEngine struct {
 	mu      sync.Mutex
 	running bool
 	stopCh  chan struct{}
+	lightCh chan lightUpdate // capture loop → light-writer goroutine
 
 	hue              HueSetter
 	casambiSend      func(level uint8, unitID uint16)
@@ -92,6 +95,29 @@ type ReactiveEngine struct {
 	lastPollTime     time.Time
 	lastBeatNum      int
 	paused           bool // true when Spotify progress_ms hasn't advanced between polls
+
+	// Track profiling — local replacement for Spotify's dead
+	// audio-features API. The first time a track plays, its audio is fed
+	// to an analyzer.Session; the resulting profile (BPM, beat phase,
+	// energy, mood) is cached so later plays get it instantly.
+	profiles     *analyzer.Store        // persistent profile cache (nil = profiling disabled)
+	profiler     *analyzer.Session      // in-flight analysis for the current track
+	profile      *analyzer.TrackProfile // profile of the current track, if known
+	currentTrack string
+	artistName   string
+	OnProfile    func(*analyzer.TrackProfile) // optional hook, called after a new profile is saved
+
+	// AI enrichment (optional): Claude adds genre, mood, and lighting
+	// direction to each profile; the engine translates that into how the
+	// lights behave for this song.
+	enricher  *analyzer.Enricher
+	enriching map[string]bool // tracks with an enrichment call in flight
+
+	// Per-song lighting behavior, set from the AI's lighting direction
+	// (defaults when no enrichment is available).
+	pulseDecay    float64       // brightness decay factor: lower = harder pulses
+	intensityBias float64       // overall brightness multiplier (0.5-1.5)
+	beatPulseGap  time.Duration // min gap between on-beat color pulses
 }
 
 const (
@@ -160,13 +186,16 @@ func NewReactiveEngine(hue HueSetter, casambiSend func(level uint8, unitID uint1
 		effectiveGain:    10,
 		spotifyURL:       spotifyURL,
 		bpm:              120,
+		pulseDecay:       0.5,
+		intensityBias:    1.0,
+		beatPulseGap:     450 * time.Millisecond,
 	}
 }
 
 func (re *ReactiveEngine) Status() map[string]any {
 	re.mu.Lock()
 	defer re.mu.Unlock()
-	return map[string]any{
+	st := map[string]any{
 		"running":       re.running,
 		"gain":          math.Round(re.effectiveGain*10) / 10,
 		"autoGain":      re.autoGain,
@@ -175,13 +204,21 @@ func (re *ReactiveEngine) Status() map[string]any {
 		"bass":          math.Round(re.bass*re.effectiveGain*1000) / 1000,
 		"mid":           math.Round(re.mid*re.effectiveGain*1000) / 1000,
 		"treble":        math.Round(re.treble*re.effectiveGain*1000) / 1000,
-		"beats":    re.beatCount,
-		"onBeat":   re.onBeat,
-		"track":    re.trackName,
-		"progress": re.estimateProgress(),
-		"paused":   re.paused,
-		"colors":   re.colors,
+		"beats":     re.beatCount,
+		"onBeat":    re.onBeat,
+		"track":     re.trackName,
+		"artist":    re.artistName,
+		"progress":  re.estimateProgress(),
+		"paused":    re.paused,
+		"colors":    re.colors,
+		"profile":   re.profile,
+		"analyzing": re.profiler != nil,
 	}
+	if re.profiler != nil {
+		st["analyzedSeconds"] = math.Round(re.profiler.Seconds()*10) / 10
+		st["targetSeconds"] = analyzer.TargetSeconds
+	}
+	return st
 }
 
 // SetAlbumColors fetches album art and extracts dominant colors for the light palette.
@@ -292,6 +329,354 @@ func (re *ReactiveEngine) SetHueSetter(hue HueSetter) {
 	re.mu.Unlock()
 }
 
+// SetProfileStore enables first-play track profiling backed by the store.
+func (re *ReactiveEngine) SetProfileStore(store *analyzer.Store) {
+	re.mu.Lock()
+	re.profiles = store
+	re.mu.Unlock()
+}
+
+// SetEnricher enables AI enrichment of track profiles.
+func (re *ReactiveEngine) SetEnricher(e *analyzer.Enricher) {
+	re.mu.Lock()
+	re.enricher = e
+	re.mu.Unlock()
+}
+
+// onTrackChange runs when the Spotify poller sees a new track: apply a
+// cached profile if one exists, otherwise start analyzing this play.
+func (re *ReactiveEngine) onTrackChange(track, artist string) {
+	re.mu.Lock()
+	re.currentTrack = track
+	re.artistName = artist
+	// Reset per-song lighting behavior until this track's profile says otherwise
+	re.pulseDecay = 0.5
+	re.intensityBias = 1.0
+	re.beatPulseGap = 450 * time.Millisecond
+	prev := re.profiler
+	re.profiler = nil
+	re.profile = nil
+	store := re.profiles
+	running := re.running
+	progress := re.estimateProgress()
+	re.mu.Unlock()
+
+	// A session from the previous track may already have enough audio.
+	if prev != nil {
+		if prev.Ready() {
+			go re.finalizeProfiler(prev)
+		} else if t, _ := prev.Track(); t != "" {
+			log.Printf("Discarding partial analysis of %q (%.0fs — need %.0fs)", t, prev.Seconds(), analyzer.MinSeconds)
+		}
+	}
+
+	if store == nil {
+		return
+	}
+
+	p := store.Get(track, artist)
+	if p != nil {
+		re.applyProfile(p)
+	}
+	// Analyze when there's no profile, or only a BPM-only import from the
+	// legacy tap-tempo cache (a full analysis upgrades it).
+	if running && (p == nil || p.Source == "legacy-bpm-cache") {
+		log.Printf("Analyzing %q — profile ready after ~%.0fs of playback", track, analyzer.TargetSeconds)
+		sess := analyzer.NewSession(track, artist, progress)
+		re.mu.Lock()
+		re.profiler = sess
+		re.mu.Unlock()
+	}
+}
+
+// applyProfile makes a cached/new profile the engine's current one and
+// seeds beat prediction with its BPM.
+func (re *ReactiveEngine) applyProfile(p *analyzer.TrackProfile) {
+	re.mu.Lock()
+	re.profile = p
+	re.bpm = p.BPM
+	if re.detectedBPM == 0 {
+		re.detectedBPM = p.BPM // predictive beats work from the first bar
+	}
+	re.mu.Unlock()
+
+	if p.Source == "legacy-bpm-cache" {
+		log.Printf("Track profile (BPM only, legacy): %s — %.0f BPM", p.Track, p.BPM)
+	} else {
+		log.Printf("Track profile: %s — %.1f BPM, %s, energy %.2f, dance %.2f, valence %.2f",
+			p.Track, p.BPM, p.Key, p.Energy, p.Danceability, p.Valence)
+	}
+
+	if p.AI != nil {
+		re.applyEnrichment(p.AI)
+	} else {
+		re.maybeEnrich(p)
+	}
+}
+
+// maybeEnrich asks Claude about the track (async) unless enrichment is
+// disabled, already present, or already in flight.
+func (re *ReactiveEngine) maybeEnrich(p *analyzer.TrackProfile) {
+	if p == nil || p.AI != nil || p.Source == "legacy-bpm-cache" {
+		return // legacy entries lack DSP data; a replay upgrades them first
+	}
+	k := strings.ToLower(p.Track + " — " + p.Artist)
+	re.mu.Lock()
+	enricher := re.enricher
+	if enricher == nil || re.enriching[k] {
+		re.mu.Unlock()
+		return
+	}
+	if re.enriching == nil {
+		re.enriching = make(map[string]bool)
+	}
+	re.enriching[k] = true
+	re.mu.Unlock()
+
+	go func() {
+		defer func() {
+			re.mu.Lock()
+			delete(re.enriching, k)
+			re.mu.Unlock()
+		}()
+
+		ai, err := enricher.Enrich(p)
+		if err != nil {
+			log.Printf("AI enrichment failed for %q: %v", p.Track, err)
+			return
+		}
+
+		enriched := *p
+		enriched.AI = ai
+
+		re.mu.Lock()
+		store := re.profiles
+		isCurrent := re.currentTrack == enriched.Track
+		if isCurrent {
+			re.profile = &enriched
+		}
+		re.mu.Unlock()
+
+		if store != nil {
+			store.Set(&enriched)
+		}
+		log.Printf("AI enrichment: %s — genre %v, moods %v, pulse %q, known=%v",
+			enriched.Track, ai.Genre, ai.Moods, ai.PulseStyle, ai.KnownTrack)
+
+		if isCurrent {
+			re.applyEnrichment(ai)
+		}
+	}()
+}
+
+// applyEnrichment translates the AI's lighting direction into engine
+// behavior: pulse hardness, overall intensity, and a palette fallback for
+// tracks whose album art yielded no colors.
+func (re *ReactiveEngine) applyEnrichment(ai *analyzer.Enrichment) {
+	if ai == nil {
+		return
+	}
+	decay, gap := 0.5, 450*time.Millisecond
+	switch ai.PulseStyle {
+	case "strobe":
+		decay, gap = 0.35, 300*time.Millisecond
+	case "pulse":
+		decay, gap = 0.5, 450*time.Millisecond
+	case "wash":
+		decay, gap = 0.7, 700*time.Millisecond
+	case "breathe":
+		decay, gap = 0.85, 900*time.Millisecond
+	}
+	bias := 1.0
+	if ai.IntensityBias != 0 {
+		bias = ai.IntensityBias
+	}
+
+	re.mu.Lock()
+	re.pulseDecay = decay
+	re.beatPulseGap = gap
+	re.intensityBias = bias
+	haveColors := re.colors != nil
+	running := re.running
+	re.mu.Unlock()
+
+	if ai.Notes != "" {
+		log.Printf("Lighting direction: %s", ai.Notes)
+	}
+
+	// Album art colors stay authoritative; the AI palette covers tracks
+	// where art extraction failed or produced nothing.
+	if !haveColors && len(ai.Palette) > 0 {
+		colors := paletteToColors(ai.Palette)
+		re.mu.Lock()
+		re.colors = colors
+		re.mu.Unlock()
+		log.Printf("Using AI palette: primary hue=%d sat=%d", colors.Primary.Hue, colors.Primary.Sat)
+		if running {
+			go re.pushCasambiColor(colors.Primary)
+		}
+	}
+}
+
+// paletteToColors converts AI palette colors (degrees, 0-1 sat) into the
+// engine's Hue-scale DominantColors.
+func paletteToColors(palette []analyzer.PaletteColor) *DominantColors {
+	toHSV := func(c analyzer.PaletteColor) HSV {
+		return HSV{
+			Hue: int(c.Hue / 360 * 65535),
+			Sat: int(c.Sat * 254),
+			Val: 254,
+		}
+	}
+	colors := &DominantColors{Primary: toHSV(palette[0]), Secondary: toHSV(palette[0])}
+	// Prefer the explicitly-tagged roles when present
+	for _, c := range palette {
+		if c.Role == "primary" {
+			colors.Primary = toHSV(c)
+		}
+	}
+	for _, c := range palette {
+		if c.Role == "secondary" || c.Role == "accent" {
+			colors.Secondary = toHSV(c)
+			break
+		}
+	}
+	if len(palette) > 1 && colors.Secondary == colors.Primary {
+		colors.Secondary = toHSV(palette[1])
+	}
+	return colors
+}
+
+// EnrichCurrent re-runs AI enrichment for the current track's profile.
+func (re *ReactiveEngine) EnrichCurrent() error {
+	re.mu.Lock()
+	p := re.profile
+	enricher := re.enricher
+	re.mu.Unlock()
+	if enricher == nil {
+		return fmt.Errorf("AI enrichment not configured — set ai.anthropic_api_key in config.yaml")
+	}
+	if p == nil {
+		return fmt.Errorf("no profile for the current track yet")
+	}
+	fresh := *p
+	fresh.AI = nil
+	re.mu.Lock()
+	re.profile = &fresh
+	re.mu.Unlock()
+	re.maybeEnrich(&fresh)
+	return nil
+}
+
+// finalizeProfiler computes, saves, and applies a finished analysis session.
+func (re *ReactiveEngine) finalizeProfiler(sess *analyzer.Session) {
+	profile, err := sess.Finalize()
+	if err != nil {
+		log.Printf("Track analysis failed: %v", err)
+		return
+	}
+
+	re.mu.Lock()
+	store := re.profiles
+	current := re.currentTrack
+	hook := re.OnProfile
+	re.mu.Unlock()
+
+	if store != nil {
+		store.Set(profile)
+	}
+	log.Printf("Analyzed %q: %.1f BPM (conf %.2f), %s, energy %.2f, dance %.2f, valence %.2f [%.0fs of audio]",
+		profile.Track, profile.BPM, profile.TempoConfidence, profile.Key,
+		profile.Energy, profile.Danceability, profile.Valence, profile.AnalyzedSeconds)
+
+	if profile.Track == current {
+		re.applyProfile(profile) // also kicks off AI enrichment
+	} else {
+		re.maybeEnrich(profile) // enrich the saved profile for next play
+	}
+	if hook != nil {
+		hook(profile)
+	}
+}
+
+// maybeStartProfiling begins analysis for the current track when reactive
+// mode starts mid-song and no (full) profile exists yet.
+func (re *ReactiveEngine) maybeStartProfiling() {
+	re.mu.Lock()
+	track, artist := re.currentTrack, re.artistName
+	store := re.profiles
+	inFlight := re.profiler != nil
+	progress := re.estimateProgress()
+	re.mu.Unlock()
+
+	if store == nil || track == "" || inFlight {
+		return
+	}
+	if p := store.Get(track, artist); p != nil && p.Source != "legacy-bpm-cache" {
+		return
+	}
+	log.Printf("Analyzing %q — profile ready after ~%.0fs of playback", track, analyzer.TargetSeconds)
+	sess := analyzer.NewSession(track, artist, progress)
+	re.mu.Lock()
+	re.profiler = sess
+	re.mu.Unlock()
+}
+
+// AnalyzerStatus reports profiling progress and the current track profile.
+func (re *ReactiveEngine) AnalyzerStatus() map[string]any {
+	re.mu.Lock()
+	prof := re.profiler
+	profile := re.profile
+	track, artist := re.currentTrack, re.artistName
+	store := re.profiles
+	re.mu.Unlock()
+
+	st := map[string]any{
+		"enabled":   store != nil,
+		"track":     track,
+		"artist":    artist,
+		"analyzing": prof != nil,
+		"profile":   profile,
+	}
+	if prof != nil {
+		st["analyzed_seconds"] = math.Round(prof.Seconds()*10) / 10
+		st["target_seconds"] = analyzer.TargetSeconds
+	}
+	if store != nil {
+		st["cached_profiles"] = store.Len()
+	}
+	return st
+}
+
+// ReanalyzeCurrent drops the current track's cached profile and analyzes
+// this play from scratch.
+func (re *ReactiveEngine) ReanalyzeCurrent() error {
+	re.mu.Lock()
+	track, artist := re.currentTrack, re.artistName
+	store := re.profiles
+	running := re.running
+	progress := re.estimateProgress()
+	re.mu.Unlock()
+
+	if store == nil {
+		return fmt.Errorf("track profiling not configured")
+	}
+	if track == "" {
+		return fmt.Errorf("no track playing")
+	}
+	store.Delete(track, artist)
+	if !running {
+		return fmt.Errorf("profile cleared — start reactive mode so audio can be analyzed")
+	}
+	sess := analyzer.NewSession(track, artist, progress)
+	re.mu.Lock()
+	re.profile = nil
+	re.profiler = sess
+	re.mu.Unlock()
+	log.Printf("Re-analyzing %q", track)
+	return nil
+}
+
 // StartSpotifyPoller launches the now-playing poller for the process
 // lifetime. Safe to call more than once; the loop idles while no URL is set.
 func (re *ReactiveEngine) StartSpotifyPoller() {
@@ -368,6 +753,7 @@ func (re *ReactiveEngine) Start() error {
 
 	re.running = true
 	re.stopCh = make(chan struct{})
+	re.lightCh = make(chan lightUpdate, 1)
 	colors := re.colors
 	re.mu.Unlock()
 
@@ -377,7 +763,12 @@ func (re *ReactiveEngine) Start() error {
 		go re.pushCasambiColor(colors.Primary)
 	}
 
+	go re.lightWriter(re.stopCh, re.lightCh)
 	go re.run()
+
+	// If the poller already knows the track and it has no profile yet,
+	// analyze this play.
+	re.maybeStartProfiling()
 	return nil
 }
 
@@ -477,6 +868,22 @@ func (re *ReactiveEngine) run() {
 		samples := make([]float64, len(buf))
 		for i, s := range buf {
 			samples[i] = float64(s)
+		}
+
+		// Feed the track profiler (first-play analysis). Skipped while
+		// Spotify is paused so silence doesn't skew the profile.
+		re.mu.Lock()
+		prof := re.profiler
+		profPaused := re.paused
+		re.mu.Unlock()
+		if prof != nil && !profPaused {
+			prof.Feed(samples)
+			if prof.Done() {
+				re.mu.Lock()
+				re.profiler = nil
+				re.mu.Unlock()
+				go re.finalizeProfiler(prof)
+			}
 		}
 
 		// Analyze audio for intensity/frequency
@@ -614,6 +1021,14 @@ func (re *ReactiveEngine) pollSpotify() {
 			lastTrack = trackName
 			log.Printf("Now playing: %s", trackName)
 
+			artistName := ""
+			if len(np.Data.Item.Album.Artists) > 0 {
+				artistName = np.Data.Item.Album.Artists[0].Name
+			}
+
+			// Apply a cached track profile or start analyzing this play
+			re.onTrackChange(trackName, artistName)
+
 			// Extract album art colors
 			var imageURL string
 			for _, img := range np.Data.Item.Album.Images {
@@ -729,11 +1144,15 @@ func (re *ReactiveEngine) medianInterval() float64 {
 }
 
 func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bool) {
-	// Apply gain to boost audio input; snapshot light targets (mutable via settings)
+	// Apply gain to boost audio input; snapshot light targets (mutable via
+	// settings) and the per-song lighting behavior (set by AI enrichment)
 	re.mu.Lock()
 	gain := re.effectiveGain
 	casambiUnits := append([]uint16(nil), re.CasambiUnits...)
 	hueLights := append([]string(nil), re.HueLights...)
+	pulseDecay := re.pulseDecay
+	intensityBias := re.intensityBias
+	beatPulseGap := re.beatPulseGap
 	re.mu.Unlock()
 	rms = rms * gain
 	bass = bass * gain
@@ -743,15 +1162,17 @@ func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bo
 	// Casambi: hold a low ambient baseline so the beat spike to 255 is dramatic.
 	// The 5-channel fixture perceptually compresses brightness — going from 200
 	// to 255 reads as "no change". Going from ~60 to 255 reads as a clear pulse.
-	targetBri := clamp(rms*120, 0, 200) // ambient ceiling well below max
+	targetBri := clamp(rms*120*intensityBias, 0, 200) // ambient ceiling well below max
 	if isBeat {
-		targetBri = 255
+		targetBri = clamp(255*intensityBias, 0, 255)
 	}
-	// Asymmetric smoothing: instant attack on beats, fast decay for contrast
+	// Asymmetric smoothing: instant attack on beats, tunable decay for
+	// contrast. The AI's pulse style sets the decay: strobe = hard drops,
+	// breathe = slow ambient swell.
 	if targetBri > re.smoothBri {
 		re.smoothBri = targetBri // instant jump up
 	} else {
-		re.smoothBri = re.smoothBri*0.5 + targetBri*0.5 // faster decay = more contrast
+		re.smoothBri = re.smoothBri*pulseDecay + targetBri*(1-pulseDecay)
 	}
 	casambiBri := uint8(clamp(re.smoothBri, 0, 255))
 
@@ -775,27 +1196,17 @@ func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bo
 	if shouldSendCasambi && re.casambiSend != nil {
 		re.lastCasambiBri = casambiBri
 		re.lastCmdTime = now
-		for i, unitID := range casambiUnits {
-			if i > 0 {
-				time.Sleep(25 * time.Millisecond) // space writes across units
-			}
-			re.casambiSend(casambiBri, unitID)
-		}
+	} else {
+		shouldSendCasambi = false
 	}
 
 	// On-beat color flash: shift hue ~90° from album primary and revert.
 	// More visible than brightness pulses on the LINE 5xDIM's slew-limited
-	// dimmer channel. Debounced to once per 450ms to keep pulses distinct
-	// and avoid stacking goroutines at fast BPM.
-	if isBeat && colors != nil && now.Sub(re.lastBeatPulseTime) > 450*time.Millisecond {
+	// dimmer channel. Debounced (gap set by the AI's pulse style) to keep
+	// pulses distinct and avoid stacking goroutines at fast BPM.
+	if isBeat && colors != nil && now.Sub(re.lastBeatPulseTime) > beatPulseGap {
 		re.lastBeatPulseTime = now
 		go re.beatColorPulse(colors.Primary)
-	}
-
-	// Small delay before Hue to let Casambi commands get a head start
-	// BLE write takes ~50-100ms, Hue UDP takes ~40ms, so this helps sync them
-	if isBeat && shouldSendCasambi {
-		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Hue: use album art colors, blend between primary (bass) and secondary (treble)
@@ -817,10 +1228,10 @@ func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bo
 	}
 	hueColor := int(float64(primary.Hue)*primaryWeight + float64(secondary.Hue)*(1-primaryWeight))
 	hueSat := int(float64(primary.Sat)*primaryWeight + float64(secondary.Sat)*(1-primaryWeight))
-	hueBri := int(clamp(rms*254, 5, 254))
+	hueBri := int(clamp(rms*254*intensityBias, 5, 254))
 
 	if isBeat {
-		hueBri = 254
+		hueBri = int(clamp(254*intensityBias, 5, 254))
 		hueSat = min(hueSat+50, 254)
 		hueColor = primary.Hue // snap to primary color on beat
 	}
@@ -843,14 +1254,101 @@ func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bo
 	shouldSendHue := hue != nil && (isBeat || hueBriDelta > 20 || now.Sub(re.lastCmdTime) > 150*time.Millisecond)
 	if shouldSendHue {
 		re.lastHueBri = hueBri
-		for _, lightID := range hueLights {
-			go hue.SetState(lightID, map[string]any{
-				"on":             true,
-				"hue":            hueColor % 65536,
-				"sat":            hueSat,
-				"bri":            hueBri,
-				"transitiontime": transition,
-			})
+	}
+
+	// Hand the actual I/O (BLE writes with inter-unit gaps, Hue sends) to the
+	// light-writer goroutine. The capture loop must never sleep or block:
+	// audio arrives every ~23ms and dropped frames starve beat detection and
+	// the track analyzer (analysis crawled at ~10% of real time before this).
+	if shouldSendCasambi || shouldSendHue {
+		re.pushLights(lightUpdate{
+			sendCasambi:  shouldSendCasambi,
+			casambiBri:   casambiBri,
+			casambiUnits: casambiUnits,
+			beatSync:     isBeat && shouldSendCasambi,
+			sendHue:      shouldSendHue,
+			hue:          hue,
+			hueLights:    hueLights,
+			hueColor:     hueColor % 65536,
+			hueSat:       hueSat,
+			hueBri:       hueBri,
+			transition:   transition,
+		})
+	}
+}
+
+// lightUpdate is one frame of light intent, computed by updateLights and
+// executed by the light-writer goroutine.
+type lightUpdate struct {
+	sendCasambi  bool
+	casambiBri   uint8
+	casambiUnits []uint16
+	beatSync     bool // pause between Casambi and Hue so the beat lands together
+	sendHue      bool
+	hue          HueSetter
+	hueLights    []string
+	hueColor     int
+	hueSat       int
+	hueBri       int
+	transition   int
+}
+
+// pushLights hands an update to the writer, keeping only the newest frame
+// when the writer is mid-send (latest-wins, never blocks the capture loop).
+func (re *ReactiveEngine) pushLights(u lightUpdate) {
+	re.mu.Lock()
+	ch := re.lightCh
+	re.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- u:
+	default:
+		select {
+		case <-ch: // drop the stale frame
+		default:
+		}
+		select {
+		case ch <- u:
+		default:
+		}
+	}
+}
+
+// lightWriter performs the slow light I/O — BLE writes with the inter-unit
+// spacing the fixture needs, the Casambi→Hue beat-sync gap, and Hue sends —
+// off the audio capture path.
+func (re *ReactiveEngine) lightWriter(stopCh chan struct{}, ch chan lightUpdate) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		case u := <-ch:
+			if u.sendCasambi && re.casambiSend != nil {
+				for i, unitID := range u.casambiUnits {
+					if i > 0 {
+						time.Sleep(25 * time.Millisecond) // space writes across units
+					}
+					re.casambiSend(u.casambiBri, unitID)
+				}
+			}
+			// Small delay before Hue to let Casambi commands get a head start:
+			// BLE write takes ~50-100ms, Hue UDP ~40ms, so this syncs the beat.
+			if u.beatSync {
+				time.Sleep(50 * time.Millisecond)
+			}
+			if u.sendHue && u.hue != nil {
+				for _, lightID := range u.hueLights {
+					go u.hue.SetState(lightID, map[string]any{
+						"on":             true,
+						"hue":            u.hueColor,
+						"sat":            u.hueSat,
+						"bri":            u.hueBri,
+						"transitiontime": u.transition,
+					})
+				}
+			}
 		}
 	}
 }

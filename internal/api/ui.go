@@ -19,6 +19,9 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// The page is rebuilt into the binary on every deploy; without this,
+	// browsers heuristically cache it and show a stale UI after upgrades.
+	w.Header().Set("Cache-Control", "no-cache")
 	w.Write(page)
 }
 

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migueltejeda/casambi-go/internal/analyzer"
 	"github.com/migueltejeda/casambi-go/internal/audio"
 	"github.com/migueltejeda/casambi-go/internal/ble"
 	"github.com/migueltejeda/casambi-go/internal/config"
@@ -25,6 +26,7 @@ type Server struct {
 	HueStreamer *HueStreamer
 	beatSync    *spotify.BeatSync
 	reactive    *audio.ReactiveEngine
+	profiles    *analyzer.Store // nil when profiling is disabled
 	mux         *http.ServeMux
 	opts        ServerOptions
 	cfgMu       sync.Mutex // guards opts.Config across settings handlers
@@ -39,6 +41,7 @@ type ServerOptions struct {
 	ReactiveCasambiUnits []uint16
 	ReactiveHueLights    []string
 	BPMCachePath         string
+	ProfileStorePath     string // track profile cache; "" disables first-play analysis
 	Config               *config.Config // full config, for the settings API (may be nil)
 	ConfigPath           string         // where PUT /api/config persists ("" = default)
 }
@@ -79,6 +82,25 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 		reactive: audio.NewReactiveEngine(hueForReactive, casambiSend, casambiState, casambiColor, casambiFullState, opts.SpotifyURL, opts.ReactiveCasambiUnits, opts.ReactiveHueLights),
 		opts:     opts,
 		seq:      1,
+	}
+
+	// Track profiling: the analyzer builds BPM/energy/mood profiles from
+	// the first play of each track (replacing Spotify's dead audio-features
+	// API) and shares new BPMs with the legacy beat-sync cache.
+	if opts.ProfileStorePath != "" {
+		store := analyzer.LoadStore(opts.ProfileStorePath, opts.BPMCachePath)
+		s.profiles = store
+		s.reactive.SetProfileStore(store)
+		s.reactive.OnProfile = func(p *analyzer.TrackProfile) {
+			s.beatSync.CacheBPM(p.Track, p.Artist, p.BPM)
+		}
+	}
+
+	// AI enrichment: Claude adds genre, mood, refined scores, and lighting
+	// direction to each analyzed track (requires an Anthropic API key).
+	if opts.Config != nil && opts.Config.AI.AnthropicAPIKey != "" {
+		s.reactive.SetEnricher(analyzer.NewEnricher(opts.Config.AI.AnthropicAPIKey, opts.Config.AI.Model))
+		log.Println("AI track enrichment enabled")
 	}
 
 	// The now-playing poller runs for the server's lifetime so the dashboard
@@ -131,6 +153,12 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 	mux.HandleFunc("POST /api/reactive/gain", s.handleReactiveGain)
 	mux.HandleFunc("POST /api/reactive/autogain", s.handleReactiveAutoGain)
 	mux.HandleFunc("POST /api/reactive/bpm", s.handleReactiveBPM)
+
+	// Song analyzer — first-play track profiling (BPM, beat grid, energy, mood)
+	mux.HandleFunc("GET /api/analyzer/status", s.handleAnalyzerStatus)
+	mux.HandleFunc("GET /api/analyzer/profiles", s.handleAnalyzerProfiles)
+	mux.HandleFunc("POST /api/analyzer/reanalyze", s.handleAnalyzerReanalyze)
+	mux.HandleFunc("POST /api/analyzer/enrich", s.handleAnalyzerEnrich)
 
 	// Hue lights (HTTP to bridge)
 	mux.HandleFunc("GET /api/hue/lights", s.handleListHueLights)
@@ -230,6 +258,12 @@ func (s *Server) handleHelp(w http.ResponseWriter, r *http.Request) {
 				"POST /api/reactive/gain":     "{\"gain\": 1-500}",
 				"POST /api/reactive/autogain": "{\"enabled\": true}",
 			},
+			"song_analyzer": map[string]string{
+				"GET  /api/analyzer/status":    "Profiling progress + current track profile",
+				"GET  /api/analyzer/profiles":  "All cached profiles (BPM, energy, mood, key)",
+				"POST /api/analyzer/reanalyze": "Drop current track's profile and re-analyze",
+				"POST /api/analyzer/enrich":    "Re-run AI enrichment (genre, mood, lighting direction)",
+			},
 			"dashboard": map[string]string{
 				"GET /": "Web UI dashboard",
 			},
@@ -258,8 +292,12 @@ func (s *Server) handleHelp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	status := "connected"
+	if s.conn.Dead() {
+		status = "ble_connection_lost — restart to reconnect"
+	}
 	s.writeJSON(w, map[string]any{
-		"status":    "connected",
+		"status":    status,
 		"network":   s.creds.NetworkID,
 		"units":     len(s.creds.Units),
 		"scenes":    len(s.creds.Scenes),
@@ -608,6 +646,43 @@ func (s *Server) handleReactiveBPM(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, map[string]any{"status": "ok", "bpm": body.BPM})
 }
 
+// ── Song Analyzer Handlers ────────────────────────────────
+
+// handleAnalyzerStatus reports profiling progress and the current profile.
+func (s *Server) handleAnalyzerStatus(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, s.reactive.AnalyzerStatus())
+}
+
+// handleAnalyzerProfiles lists every cached track profile.
+func (s *Server) handleAnalyzerProfiles(w http.ResponseWriter, r *http.Request) {
+	if s.profiles == nil {
+		s.writeError(w, "track profiling not configured", http.StatusServiceUnavailable)
+		return
+	}
+	s.writeJSON(w, map[string]any{
+		"count":    s.profiles.Len(),
+		"profiles": s.profiles.All(),
+	})
+}
+
+// handleAnalyzerReanalyze drops the current track's profile and re-analyzes.
+func (s *Server) handleAnalyzerReanalyze(w http.ResponseWriter, r *http.Request) {
+	if err := s.reactive.ReanalyzeCurrent(); err != nil {
+		s.writeError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.writeJSON(w, map[string]any{"status": "analyzing"})
+}
+
+// handleAnalyzerEnrich re-runs AI enrichment for the current track.
+func (s *Server) handleAnalyzerEnrich(w http.ResponseWriter, r *http.Request) {
+	if err := s.reactive.EnrichCurrent(); err != nil {
+		s.writeError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.writeJSON(w, map[string]any{"status": "enriching"})
+}
+
 func (s *Server) handleReactiveGain(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Gain float64 `json:"gain"`
@@ -649,6 +724,8 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	view := *s.opts.Config
 	view.Reactive.CasambiUnits = s.reactive.CasambiTargets()
 	view.Reactive.HueLights = s.reactive.HueTargets()
+	// Never expose the API key over the (unauthenticated) HTTP API.
+	view.AI.AnthropicAPIKey = ""
 	s.writeJSON(w, view)
 }
 
@@ -676,9 +753,15 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if updated.Server.Bind == "" {
 		updated.Server.Bind = "127.0.0.1"
 	}
+	// GET redacts the API key, so a settings round-trip sends it back empty —
+	// treat empty as "keep the existing key" (clear it by editing the file).
+	if updated.AI.AnthropicAPIKey == "" {
+		updated.AI.AnthropicAPIKey = s.opts.Config.AI.AnthropicAPIKey
+	}
 
 	restart := updated.Server != s.opts.Config.Server ||
-		!reflect.DeepEqual(updated.Hue, s.opts.Config.Hue)
+		!reflect.DeepEqual(updated.Hue, s.opts.Config.Hue) ||
+		updated.AI != s.opts.Config.AI
 
 	if err := updated.Save(s.opts.ConfigPath); err != nil {
 		s.writeError(w, "save config: "+err.Error(), http.StatusInternalServerError)

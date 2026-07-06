@@ -97,6 +97,16 @@
   #save-status { margin-top: 8px; min-height: 18px; }
   #save-status.ok { color: var(--ok); }
   #save-status.warn { color: var(--warn); }
+
+  /* Track profile / AI */
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  .chip { background: var(--panel2); border-radius: 20px; padding: 3px 11px; font-size: 12px; white-space: nowrap; }
+  .chip b { font-weight: 700; }
+  .chip.hl { background: var(--accent); color: #fff; }
+  .pal { width: 24px; height: 24px; border-radius: 6px; flex-shrink: 0; }
+  .ptrack { height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .pbar { height: 100%; background: var(--accent); border-radius: 3px; transition: width .5s linear; }
+  #profile-note { font-size: 13px; color: var(--dim); margin-top: 8px; font-style: italic; }
 </style>
 </head>
 <body>
@@ -124,6 +134,11 @@
     <div class="band" id="bar-treble"><div class="bar-track"><div class="bar"></div></div><label>Treble</label></div>
     <div id="beat"><span id="bpm">—</span><small>bpm</small></div>
   </div>
+</div>
+
+<div class="panel">
+  <h2>Track Profile</h2>
+  <div id="profile-body" class="muted">No profile yet — start reactive mode and let a song play ~45s.</div>
 </div>
 
 <div class="panel">
@@ -220,6 +235,73 @@ function render(st) {
 
   if (!gainDragging) { $('gain').value = Math.min(200, st.gain); $('gainval').textContent = st.gain; }
   $('autogain').classList.toggle('active', st.autoGain);
+
+  renderProfile(st);
+}
+
+// ── Track profile / AI card ───────────────────────────────
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const aiHsl = c => `hsl(${Math.round(c.hue)}, ${Math.round(c.sat * 100)}%, 55%)`;
+const mmss = ms => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
+
+let lastProfileKey = '';
+function renderProfile(st) {
+  // Re-render only when the underlying data changes (stream is ~12 Hz)
+  const key = JSON.stringify([st.analyzing, Math.floor(st.analyzedSeconds || 0), st.profile]);
+  if (key === lastProfileKey) return;
+  lastProfileKey = key;
+
+  const el = $('profile-body');
+  const p = st.profile;
+
+  if (!p && st.analyzing) {
+    const secs = st.analyzedSeconds || 0, target = st.targetSeconds || 45;
+    el.className = 'muted';
+    el.innerHTML = `Listening to “${esc(st.track)}” — ${Math.floor(secs)}s of ${target}s needed
+      <div class="ptrack"><div class="pbar" style="width:${Math.min(100, secs / target * 100)}%"></div></div>`;
+    return;
+  }
+  if (!p) {
+    el.className = 'muted';
+    el.textContent = st.running
+      ? 'No profile yet — let a song play ~45 seconds.'
+      : 'No profile yet — start reactive mode and let a song play ~45s.';
+    return;
+  }
+
+  el.className = '';
+  let html = `<div class="chips">
+    <span class="chip"><b>${p.bpm}</b> BPM</span>
+    <span class="chip">${esc(p.key || '?')}</span>
+    <span class="chip">energy <b>${p.energy}</b></span>
+    <span class="chip">dance <b>${p.danceability}</b></span>
+    <span class="chip">valence <b>${p.valence}</b></span>
+    ${p.source === 'legacy-bpm-cache' ? '<span class="chip">tap-tempo only</span>' : ''}
+  </div>`;
+
+  const ai = p.ai;
+  if (ai) {
+    html += `<h3>AI · ${ai.known_track ? 'knows this song' : 'from audio only'}</h3>`;
+    html += `<div class="chips">
+      ${(ai.genre || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}
+      ${(ai.moods || []).map(m => `<span class="chip">${esc(m)}</span>`).join('')}
+    </div>`;
+    html += `<div class="chips">
+      ${ai.pulse_style ? `<span class="chip hl">${esc(ai.pulse_style)}</span>` : ''}
+      ${ai.intensity_bias ? `<span class="chip">brightness ×${ai.intensity_bias}</span>` : ''}
+      ${(ai.palette || []).map(c => `<span class="pal" title="${esc(c.name)} (${esc(c.role || '')})" style="background:${aiHsl(c)}"></span>`).join('')}
+      ${(ai.palette || []).length ? '<span class="chip" style="background:none;color:var(--dim)">AI palette</span>' : ''}
+    </div>`;
+    if (ai.structure && ai.structure.length) {
+      html += `<div class="chips">${ai.structure.map(sec =>
+        `<span class="chip" title="${esc(sec.note || '')}">${esc(sec.label)} @ ${mmss(sec.at_ms)}</span>`).join('')}</div>`;
+    }
+    if (ai.notes) html += `<div id="profile-note">“${esc(ai.notes)}”</div>`;
+  } else if (st.analyzing === false && p.source !== 'legacy-bpm-cache') {
+    html += `<div class="muted">AI enrichment pending…</div>`;
+  }
+  el.innerHTML = html;
 }
 
 // ── Controls ──────────────────────────────────────────────
