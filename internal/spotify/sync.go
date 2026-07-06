@@ -280,6 +280,20 @@ func (bs *BeatSync) Tap() float64 {
 	return bs.bpm
 }
 
+// CacheBPM stores an externally-determined BPM (e.g. from the song
+// analyzer) and applies it immediately if that track is playing now.
+func (bs *BeatSync) CacheBPM(track, artist string, bpm float64) {
+	if track == "" || bpm < 30 || bpm > 300 {
+		return
+	}
+	bs.bpmCache.Set(track, artist, bpm)
+	bs.mu.Lock()
+	if bs.track == track {
+		bs.bpm = bpm
+	}
+	bs.mu.Unlock()
+}
+
 // SaveCurrentBPM saves the current BPM to the cache for the current track.
 func (bs *BeatSync) SaveCurrentBPM() {
 	bs.mu.Lock()

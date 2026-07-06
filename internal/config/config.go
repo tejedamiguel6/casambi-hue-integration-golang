@@ -21,6 +21,7 @@ type Config struct {
 	Hue      HueConfig      `yaml:"hue" json:"hue"`
 	Spotify  SpotifyConfig  `yaml:"spotify" json:"spotify"`
 	Reactive ReactiveConfig `yaml:"reactive" json:"reactive"`
+	AI       AIConfig       `yaml:"ai" json:"ai"`
 }
 
 type ServerConfig struct {
@@ -59,6 +60,14 @@ type ReactiveConfig struct {
 	HueLights    []string `yaml:"hue_lights" json:"hue_lights"`
 }
 
+type AIConfig struct {
+	// AnthropicAPIKey enables AI track enrichment (genre, mood, lighting
+	// direction) on top of the DSP song analyzer. Empty = disabled.
+	AnthropicAPIKey string `yaml:"anthropic_api_key" json:"anthropic_api_key"`
+	// Model overrides the default Claude model for enrichment calls.
+	Model string `yaml:"model" json:"model"`
+}
+
 // Configured reports whether a Hue bridge is set up.
 func (h HueConfig) Configured() bool {
 	return h.BridgeIP != "" && h.Username != ""
@@ -90,6 +99,9 @@ func Dir() string {
 func Path() string            { return filepath.Join(Dir(), "config.yaml") }
 func CredentialsPath() string { return filepath.Join(Dir(), "credentials.json") }
 func BPMCachePath() string    { return filepath.Join(Dir(), "bpm_cache.json") }
+
+// ProfileStorePath is where analyzed track profiles (BPM, energy, mood) live.
+func ProfileStorePath() string { return filepath.Join(Dir(), "track_profiles.json") }
 
 // Load reads the config at path (or the default location when path is "").
 // A missing file is not an error: it returns defaults and found=false.
@@ -127,6 +139,8 @@ const fileHeader = `# casambi-go configuration
 #                    clientkey + entertainment_area enable 25 Hz streaming
 #   spotify          optional now-playing endpoint for album-art colors
 #   reactive         which lights music-reactive mode drives
+#   ai               optional Anthropic API key for AI track enrichment
+#                    (genre, mood, lighting direction per song)
 `
 
 // Save writes the config to path (or the default location when path is "").
@@ -161,5 +175,8 @@ func (c *Config) ApplyEnvOverrides() {
 	}
 	if v := os.Getenv("SPOTIFY_NOW_PLAYING_URL"); v != "" {
 		c.Spotify.NowPlayingURL = v
+	}
+	if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" {
+		c.AI.AnthropicAPIKey = v
 	}
 }

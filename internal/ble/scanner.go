@@ -32,6 +32,14 @@ type Connection struct {
 	notifyCh       chan []byte // shared notification channel
 	commandCounter uint32     // outgoing command counter, starts at 2 (1 is used by auth)
 	cmdMu          sync.Mutex // protects commandCounter and serializes BLE writes
+	dead           bool       // set when a write times out; the link is unusable until restart
+}
+
+// Dead reports whether the BLE link has been declared lost (a write timed out).
+func (c *Connection) Dead() bool {
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+	return c.dead
 }
 
 // This is the service UUID that all Casambi devices advertise.
@@ -421,6 +429,10 @@ func (c *Connection) SendCommand(cmd *protocol.CommandPacket) error {
 	c.cmdMu.Lock()
 	defer c.cmdMu.Unlock()
 
+	if c.dead {
+		return fmt.Errorf("BLE connection lost — restart to reconnect")
+	}
+
 	payload := cmd.Encode()
 
 	// Build full packet: [counter: 4B LE] [0x07 type] [command data]
@@ -447,9 +459,24 @@ func (c *Connection) SendCommand(cmd *protocol.CommandPacket) error {
 
 	fmt.Printf("Command (counter=%d, %d bytes): %x\n", c.commandCounter, len(fullPacket), fullPacket)
 
-	_, err := c.Characteristic.Write(fullPacket)
-	if err != nil {
-		return fmt.Errorf("write command: %w", err)
+	// The characteristic write blocks forever if the BLE link silently died
+	// (macOS CoreBluetooth never times out on its own). Run it with a
+	// timeout; on timeout declare the connection dead so later commands
+	// fail fast instead of freezing every caller behind cmdMu.
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Characteristic.Write(fullPacket)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("write command: %w", err)
+		}
+	case <-time.After(3 * time.Second):
+		c.dead = true
+		fmt.Fprintln(os.Stderr, "BLE write timed out — connection lost. Light commands disabled; restart to reconnect.")
+		return fmt.Errorf("BLE write timeout — connection lost, restart to reconnect")
 	}
 
 	c.commandCounter++

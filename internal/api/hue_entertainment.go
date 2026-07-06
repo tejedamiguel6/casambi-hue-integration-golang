@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/dtls/v3"
 )
@@ -26,7 +27,23 @@ type HueStreamer struct {
 	mu   sync.Mutex
 	conn net.Conn
 	active bool
+
+	// A dead DTLS connection blocks Write inside pion's handshake mutex,
+	// which no deadline can interrupt. writeMu admits one in-flight write;
+	// concurrent frames are dropped (fine at 25 Hz). If the in-flight write
+	// is stuck past stuckAfter, the stream is declared lost, the connection
+	// closed (unblocking the writer), and SetState falls back to REST.
+	writeMu    sync.Mutex
+	writeStart time.Time // guarded by mu; zero = no write in flight
+	writeErrs  int       // guarded by mu; consecutive write failures
+	rest       *HueClient
 }
+
+const (
+	streamWriteDeadline = time.Second
+	streamStuckAfter    = 3 * time.Second
+	streamMaxErrs       = 5
+)
 
 // NewHueStreamer creates a streamer. clientKeyHex is the hex-encoded PSK from bridge registration.
 func NewHueStreamer(bridgeIP, username, clientKeyHex, areaID string, channels []int) (*HueStreamer, error) {
@@ -140,8 +157,61 @@ func (s *HueStreamer) SendRGB(r, g, b float64) error {
 	}
 
 	packet := s.buildPacket(channels, r, g, b)
+	return s.write(conn, packet)
+}
+
+// write sends one packet with single-writer admission and stuck detection.
+func (s *HueStreamer) write(conn net.Conn, packet []byte) error {
+	if !s.writeMu.TryLock() {
+		// Another write is in flight — drop this frame. If that write has
+		// been stuck for a while the stream is dead; tear it down so the
+		// stuck writer unblocks and callers fall back to REST.
+		s.mu.Lock()
+		stuck := !s.writeStart.IsZero() && time.Since(s.writeStart) > streamStuckAfter
+		s.mu.Unlock()
+		if stuck {
+			s.failStream("write stuck")
+		}
+		return nil
+	}
+	defer s.writeMu.Unlock()
+
+	s.mu.Lock()
+	s.writeStart = time.Now()
+	s.mu.Unlock()
+
+	conn.SetWriteDeadline(time.Now().Add(streamWriteDeadline))
 	_, err := conn.Write(packet)
-	return err
+
+	s.mu.Lock()
+	s.writeStart = time.Time{}
+	if err != nil {
+		s.writeErrs++
+		errs := s.writeErrs
+		s.mu.Unlock()
+		if errs >= streamMaxErrs {
+			s.failStream(fmt.Sprintf("%d consecutive write errors", errs))
+		}
+		return err
+	}
+	s.writeErrs = 0
+	s.mu.Unlock()
+	return nil
+}
+
+// failStream tears down a dead DTLS connection so SetState reverts to REST.
+func (s *HueStreamer) failStream(reason string) {
+	s.mu.Lock()
+	if s.conn == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.conn.Close() // also unblocks a writer stuck inside pion
+	s.conn = nil
+	s.active = false
+	s.writeErrs = 0
+	s.mu.Unlock()
+	log.Printf("Hue Entertainment stream lost (%s) — falling back to REST until reactive mode restarts", reason)
 }
 
 // SendChannelColors sends individual RGB colors per channel.
@@ -156,13 +226,24 @@ func (s *HueStreamer) SendChannelColors(colors map[int][3]float64) error {
 	}
 
 	packet := s.buildMultiColorPacket(colors)
-	_, err := conn.Write(packet)
-	return err
+	return s.write(conn, packet)
 }
 
 // SetState implements the same interface as HueClient for the reactive engine.
-// Converts HSV-style state to RGB and sends via streaming.
+// Converts HSV-style state to RGB and sends via streaming. When the DTLS
+// stream is down (never started or declared lost), it transparently falls
+// back to the REST API so reactive lights keep working at a lower rate.
 func (s *HueStreamer) SetState(lightID string, state map[string]any) error {
+	s.mu.Lock()
+	streaming := s.conn != nil
+	if s.rest == nil {
+		s.rest = &HueClient{BridgeIP: s.bridgeIP, Username: s.username}
+	}
+	rest := s.rest
+	s.mu.Unlock()
+	if !streaming {
+		return rest.SetState(lightID, state)
+	}
 	// Extract brightness — the main reactive parameter
 	bri := 0.0
 	if v, ok := state["bri"]; ok {
