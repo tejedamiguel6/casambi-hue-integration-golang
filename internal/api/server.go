@@ -103,6 +103,12 @@ func NewServer(conn *ble.Connection, creds *NetworkCredentials, hue *HueClient, 
 		log.Println("AI track enrichment enabled")
 	}
 
+	// Beat timing: grid-locked beats + predictive pre-firing + mic-free mode.
+	if opts.Config != nil {
+		r := opts.Config.Reactive
+		s.reactive.SetBeatConfig(r.BeatSource, r.BeatLeadMS, r.MicFree)
+	}
+
 	// The now-playing poller runs for the server's lifetime so the dashboard
 	// shows the current track even while reactive mode is off.
 	s.reactive.StartSpotifyPoller()
@@ -772,6 +778,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// Live-apply what doesn't need a restart.
 	s.reactive.SetTargets(updated.Reactive.CasambiUnits, updated.Reactive.HueLights)
 	s.reactive.SetSpotifyURL(updated.Spotify.NowPlayingURL)
+	s.reactive.SetBeatConfig(updated.Reactive.BeatSource, updated.Reactive.BeatLeadMS, updated.Reactive.MicFree)
 
 	log.Printf("Config updated via API (restart required: %v)", restart)
 	s.writeJSON(w, map[string]any{"status": "saved", "restartRequired": restart})

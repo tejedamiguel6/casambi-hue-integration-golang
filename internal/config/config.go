@@ -58,6 +58,19 @@ type ReactiveConfig struct {
 	// CasambiUnits and HueLights are the lights driven by reactive mode.
 	CasambiUnits []uint16 `yaml:"casambi_units" json:"casambi_units"`
 	HueLights    []string `yaml:"hue_lights" json:"hue_lights"`
+
+	// BeatSource picks what times the beat pulses: "auto" (the analyzed
+	// beat grid when the track's profile is trustworthy, mic onsets
+	// otherwise), "mic" (spectral-flux detection only), or "grid" (the
+	// profile grid whenever one exists).
+	BeatSource string `yaml:"beat_source" json:"beat_source"`
+	// BeatLeadMS fires grid beats this many milliseconds early so BLE and
+	// Hue transport latency lands the flash on the audible beat (default 90).
+	BeatLeadMS int `yaml:"beat_lead_ms" json:"beat_lead_ms"`
+	// MicFree drives the lights from the track profile + Spotify position
+	// alone — no live audio needed once a track has been analyzed. The mic
+	// is still used to analyze tracks that have no profile yet.
+	MicFree bool `yaml:"mic_free" json:"mic_free"`
 }
 
 type AIConfig struct {
@@ -138,7 +151,9 @@ const fileHeader = `# casambi-go configuration
 #   hue              leave bridge_ip/username empty if you have no Hue bridge;
 #                    clientkey + entertainment_area enable 25 Hz streaming
 #   spotify          optional now-playing endpoint for album-art colors
-#   reactive         which lights music-reactive mode drives
+#   reactive         which lights music-reactive mode drives, beat timing
+#                    (beat_source auto|mic|grid, beat_lead_ms), and mic_free
+#                    mode (profile + Spotify position drive the lights)
 #   ai               optional Anthropic API key for AI track enrichment
 #                    (genre, mood, lighting direction per song)
 `

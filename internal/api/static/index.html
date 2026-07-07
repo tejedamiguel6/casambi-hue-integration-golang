@@ -55,6 +55,8 @@
   #bpm { font-size: 18px; font-weight: 700; }
   #beat small { font-size: 9px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
   #beat.hit small, #beat.hit #bpm { color: #fff; }
+  #beatsrc { color: var(--accent); }
+  #beat.hit #beatsrc { color: #fff; }
 
   /* Controls */
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -94,6 +96,10 @@
     background: var(--panel2); color: var(--text); border: 0; border-radius: 8px;
     padding: 9px; width: 100%; font-size: 14px;
   }
+  select {
+    background: var(--panel2); color: var(--text); border: 0; border-radius: 8px;
+    padding: 8px; font-size: 14px;
+  }
   #save-status { margin-top: 8px; min-height: 18px; }
   #save-status.ok { color: var(--ok); }
   #save-status.warn { color: var(--warn); }
@@ -132,7 +138,7 @@
     <div class="band" id="bar-bass"><div class="bar-track"><div class="bar"></div></div><label>Bass</label></div>
     <div class="band" id="bar-mid"><div class="bar-track"><div class="bar"></div></div><label>Mid</label></div>
     <div class="band" id="bar-treble"><div class="bar-track"><div class="bar"></div></div><label>Treble</label></div>
-    <div id="beat"><span id="bpm">—</span><small>bpm</small></div>
+    <div id="beat"><span id="bpm">—</span><small>bpm</small><small id="beatsrc"></small></div>
   </div>
 </div>
 
@@ -182,6 +188,21 @@
   <div id="set-hue" class="muted">Loading…</div>
   <h3>Spotify now-playing URL</h3>
   <input type="url" id="set-spotify" placeholder="https://… (empty = track info disabled)">
+  <h3>Beat timing</h3>
+  <div class="row">
+    <span class="ctl-label">Source</span>
+    <select id="set-beatsource">
+      <option value="auto">Auto — grid when the profile is solid</option>
+      <option value="grid">Grid — whenever a profile exists</option>
+      <option value="mic">Mic — onset detection only</option>
+    </select>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span class="ctl-label">Lead ms</span>
+    <input type="number" id="set-beatlead" min="0" max="400" value="90">
+    <span class="muted">fire early to cover BLE latency</span>
+  </div>
+  <label class="chk"><input type="checkbox" id="set-micfree"><span>Mic-free mode — analyzed tracks are driven from the profile + Spotify position alone (mic only listens to new tracks)</span></label>
   <h3>Server (applies after restart)</h3>
   <label class="chk"><input type="checkbox" id="set-lan"><span>Allow other devices on the network (no auth)</span></label>
   <div class="row" style="margin-top:4px">
@@ -222,6 +243,8 @@ function render(st) {
 
   $('beat').classList.toggle('hit', st.onBeat);
   $('bpm').textContent = st.bpm > 0 ? Math.round(st.bpm) : '—';
+  $('beatsrc').textContent = !running ? '' :
+    st.beatSource === 'grid' ? (st.micFree ? 'grid · no mic' : 'grid') : 'mic';
   $('beats').textContent = st.beats > 0 ? st.beats + ' beats' : '';
 
   $('track').textContent = st.track || 'No track';
@@ -388,6 +411,9 @@ async function loadSettings() {
     return;
   }
   $('set-spotify').value = cfg.spotify?.now_playing_url || '';
+  $('set-beatsource').value = cfg.reactive?.beat_source || 'auto';
+  $('set-beatlead').value = cfg.reactive?.beat_lead_ms || 90;
+  $('set-micfree').checked = !!cfg.reactive?.mic_free;
   $('set-lan').checked = cfg.server?.bind === '0.0.0.0';
   $('set-port').value = cfg.server?.port || 8080;
 
@@ -424,6 +450,9 @@ $('save-settings').onclick = async () => {
     reactive: {
       casambi_units: [...document.querySelectorAll('.set-unit:checked')].map(c => +c.value),
       hue_lights: [...document.querySelectorAll('.set-huelight:checked')].map(c => c.value),
+      beat_source: $('set-beatsource').value,
+      beat_lead_ms: +$('set-beatlead').value || 90,
+      mic_free: $('set-micfree').checked,
     },
   };
   try {
