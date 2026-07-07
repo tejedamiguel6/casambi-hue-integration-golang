@@ -118,6 +118,20 @@ type ReactiveEngine struct {
 	pulseDecay    float64       // brightness decay factor: lower = harder pulses
 	intensityBias float64       // overall brightness multiplier (0.5-1.5)
 	beatPulseGap  time.Duration // min gap between on-beat color pulses
+
+	// Beat grid (see beatgrid.go): with a full profile, beats are computed
+	// from BPM/phase + Spotify progress instead of detected from onsets,
+	// and fired early to cover light-transport latency.
+	beatSource     string        // "auto", "mic", or "grid"
+	beatLead       time.Duration // fire grid beats this early
+	micFree        bool          // drive lights from the profile alone when possible
+	gridActive     bool          // grid currently owns beat timing
+	syntheticDrive bool          // mic-free: grid loop renders ambient frames too
+	lastGridFire   time.Time
+
+	// lightMu serializes updateLights — both the capture loop and the grid
+	// loop call it, and it mutates smoothing/throttle state.
+	lightMu sync.Mutex
 }
 
 const (
@@ -189,6 +203,8 @@ func NewReactiveEngine(hue HueSetter, casambiSend func(level uint8, unitID uint1
 		pulseDecay:       0.5,
 		intensityBias:    1.0,
 		beatPulseGap:     450 * time.Millisecond,
+		beatSource:       "auto",
+		beatLead:         defaultBeatLeadMS * time.Millisecond,
 	}
 }
 
@@ -217,6 +233,21 @@ func (re *ReactiveEngine) Status() map[string]any {
 	if re.profiler != nil {
 		st["analyzedSeconds"] = math.Round(re.profiler.Seconds()*10) / 10
 		st["targetSeconds"] = analyzer.TargetSeconds
+	}
+
+	// Beat grid: report what's timing the beats. Grid beats are instants,
+	// not frames, so hold onBeat long enough for the ~12 Hz SSE stream.
+	st["beatSource"] = "mic"
+	if re.gridActive {
+		st["beatSource"] = "grid"
+		if re.profile != nil {
+			st["bpm"] = re.profile.BPM // the BPM actually driving the lights
+			st["micBPM"] = math.Round(re.detectedBPM*10) / 10
+		}
+	}
+	st["micFree"] = re.syntheticDrive
+	if !re.lastGridFire.IsZero() && time.Since(re.lastGridFire) < 150*time.Millisecond {
+		st["onBeat"] = true
 	}
 	return st
 }
@@ -750,6 +781,9 @@ func (re *ReactiveEngine) Start() error {
 	re.beatCount = 0
 	re.paused = false
 	re.lastPollProgress = 0
+	re.gridActive = false
+	re.syntheticDrive = false
+	re.lastGridFire = time.Time{}
 
 	re.running = true
 	re.stopCh = make(chan struct{})
@@ -764,6 +798,7 @@ func (re *ReactiveEngine) Start() error {
 	}
 
 	go re.lightWriter(re.stopCh, re.lightCh)
+	go re.gridLoop(re.stopCh)
 	go re.run()
 
 	// If the poller already knows the track and it has no profile yet,
@@ -778,6 +813,8 @@ func (re *ReactiveEngine) Stop() {
 	if re.running {
 		close(re.stopCh)
 		re.running = false
+		re.gridActive = false
+		re.syntheticDrive = false
 	}
 }
 
@@ -942,18 +979,27 @@ func (re *ReactiveEngine) run() {
 		re.bass = bass
 		re.mid = mid
 		re.treble = treble
+		gridOn := re.gridActive
+		synthetic := re.syntheticDrive
+		gain := re.effectiveGain
+		paused := re.paused
+		if gridOn {
+			// The beat grid owns beat timing — mic onsets would double-fire.
+			// detectBeat still ran above, so detectedBPM keeps tracking for
+			// the dashboard comparison and for instant fallback.
+			isBeat = false
+		}
 		re.onBeat = isBeat
 		if isBeat {
 			re.beatCount++
 		}
 		re.mu.Unlock()
 
-		// Drive lights — only when there's actual audio AND Spotify isn't paused
-		re.mu.Lock()
-		paused := re.paused
-		re.mu.Unlock()
-		if rms > 0.0002 && !paused {
-			re.updateLights(rms, bass, mid, treble, isBeat)
+		// Drive lights — only when there's actual audio AND Spotify isn't
+		// paused. In mic-free (synthetic) drive the grid loop renders all
+		// frames; mic audio then only feeds the profiler above.
+		if !synthetic && rms > 0.0002 && !paused {
+			re.updateLights(rms*gain, bass*gain, mid*gain, treble*gain, isBeat)
 		}
 	}
 }
@@ -1143,21 +1189,23 @@ func (re *ReactiveEngine) medianInterval() float64 {
 	return vals[len(vals)/2]
 }
 
+// updateLights turns one frame of gain-normalized levels into light
+// commands. Called from the capture loop and (on grid beats / mic-free
+// frames) the grid loop — lightMu serializes the smoothing and throttle
+// state they share.
 func (re *ReactiveEngine) updateLights(rms, bass, mid, treble float64, isBeat bool) {
-	// Apply gain to boost audio input; snapshot light targets (mutable via
-	// settings) and the per-song lighting behavior (set by AI enrichment)
+	re.lightMu.Lock()
+	defer re.lightMu.Unlock()
+
+	// Snapshot light targets (mutable via settings) and the per-song
+	// lighting behavior (set by AI enrichment)
 	re.mu.Lock()
-	gain := re.effectiveGain
 	casambiUnits := append([]uint16(nil), re.CasambiUnits...)
 	hueLights := append([]string(nil), re.HueLights...)
 	pulseDecay := re.pulseDecay
 	intensityBias := re.intensityBias
 	beatPulseGap := re.beatPulseGap
 	re.mu.Unlock()
-	rms = rms * gain
-	bass = bass * gain
-	mid = mid * gain
-	treble = treble * gain
 
 	// Casambi: hold a low ambient baseline so the beat spike to 255 is dramatic.
 	// The 5-channel fixture perceptually compresses brightness — going from 200
