@@ -86,13 +86,14 @@ func syntheticLevels(energy float64) (rms, bass, mid, treble float64) {
 
 // gridSnapshot captures everything one grid iteration needs under the lock.
 type gridSnapshot struct {
-	on        bool    // grid owns beat timing right now
-	synthetic bool    // mic-free: grid loop renders ambient frames too
-	bpm       float64 // profile BPM driving the grid
-	phaseMS   float64
-	energy    float64
-	posMS     float64 // estimated playback position
-	lead      time.Duration
+	on          bool    // grid owns beat timing right now
+	synthetic   bool    // mic-free: grid loop renders ambient frames too
+	idleAmbient bool    // mic-free without a grid: hold a steady ambient level
+	bpm         float64 // profile BPM driving the grid
+	phaseMS     float64
+	energy      float64
+	posMS       float64 // estimated playback position
+	lead        time.Duration
 }
 
 func (re *ReactiveEngine) gridSnapshot() gridSnapshot {
@@ -130,6 +131,12 @@ func (re *ReactiveEngine) gridSnapshot() gridSnapshot {
 
 	snap.on = usable
 	snap.synthetic = re.syntheticDrive
+	// Mic-free with no usable grid (track not profiled yet, or the profile
+	// is legacy/BPM-only): hold a steady ambient level while a track plays
+	// so the lights aren't frozen dark while the analyzer listens.
+	snap.idleAmbient = re.micFree && !usable && re.running &&
+		re.currentTrack != "" && !re.paused &&
+		!re.lastPollTime.IsZero() && time.Since(re.lastPollTime) < gridMaxPollAge
 	if usable {
 		snap.bpm = p.BPM
 		snap.phaseMS = p.BeatPhaseMS
@@ -154,6 +161,9 @@ func (re *ReactiveEngine) gridLoop(stopCh chan struct{}) {
 		snap := re.gridSnapshot()
 
 		if !snap.on {
+			if snap.idleAmbient {
+				re.driveSynthetic(snap.energy) // energy 0 → 0.5 fallback level
+			}
 			select {
 			case <-stopCh:
 				return

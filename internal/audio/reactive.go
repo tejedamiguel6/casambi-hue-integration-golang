@@ -245,7 +245,7 @@ func (re *ReactiveEngine) Status() map[string]any {
 			st["micBPM"] = math.Round(re.detectedBPM*10) / 10
 		}
 	}
-	st["micFree"] = re.syntheticDrive
+	st["micFree"] = re.micFree
 	if !re.lastGridFire.IsZero() && time.Since(re.lastGridFire) < 150*time.Millisecond {
 		st["onBeat"] = true
 	}
@@ -980,7 +980,7 @@ func (re *ReactiveEngine) run() {
 		re.mid = mid
 		re.treble = treble
 		gridOn := re.gridActive
-		synthetic := re.syntheticDrive
+		micFree := re.micFree
 		gain := re.effectiveGain
 		paused := re.paused
 		if gridOn {
@@ -996,9 +996,10 @@ func (re *ReactiveEngine) run() {
 		re.mu.Unlock()
 
 		// Drive lights — only when there's actual audio AND Spotify isn't
-		// paused. In mic-free (synthetic) drive the grid loop renders all
-		// frames; mic audio then only feeds the profiler above.
-		if !synthetic && rms > 0.0002 && !paused {
+		// paused. In mic-free mode the mic NEVER drives lights (room noise
+		// and speech read as beats); it only feeds the profiler above, and
+		// the grid loop renders all light frames.
+		if !micFree && rms > 0.0002 && !paused {
 			re.updateLights(rms*gain, bass*gain, mid*gain, treble*gain, isBeat)
 		}
 	}

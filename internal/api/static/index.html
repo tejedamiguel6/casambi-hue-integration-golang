@@ -202,7 +202,7 @@
     <input type="number" id="set-beatlead" min="0" max="400" value="90">
     <span class="muted">fire early to cover BLE latency</span>
   </div>
-  <label class="chk"><input type="checkbox" id="set-micfree"><span>Mic-free mode — analyzed tracks are driven from the profile + Spotify position alone (mic only listens to new tracks)</span></label>
+  <label class="chk"><input type="checkbox" id="set-micfree"><span>Mic-free mode — the mic never drives the lights: profiled tracks run on the beat grid, new tracks hold a steady ambient level while the analyzer profiles them</span></label>
   <h3>Server (applies after restart)</h3>
   <label class="chk"><input type="checkbox" id="set-lan"><span>Allow other devices on the network (no auth)</span></label>
   <div class="row" style="margin-top:4px">
@@ -244,7 +244,8 @@ function render(st) {
   $('beat').classList.toggle('hit', st.onBeat);
   $('bpm').textContent = st.bpm > 0 ? Math.round(st.bpm) : '—';
   $('beatsrc').textContent = !running ? '' :
-    st.beatSource === 'grid' ? (st.micFree ? 'grid · no mic' : 'grid') : 'mic';
+    st.beatSource === 'grid' ? (st.micFree ? 'grid · no mic' : 'grid') :
+    st.micFree ? 'no mic' : 'mic';
   $('beats').textContent = st.beats > 0 ? st.beats + ' beats' : '';
 
   $('track').textContent = st.track || 'No track';
